@@ -6,6 +6,9 @@ import { type JiraConfig, type JiraIssue } from "./jira-types";
 async function fetchJira(url: string, path: string, pat: string, options: RequestInit = {}) {
   const cleanUrl = url.replace(/\/$/, "");
   const targetUrl = `${cleanUrl}${path}`;
+  const method = options.method || "GET";
+
+  console.log(`📡 [JIRA Outgoing] ${method} -> ${targetUrl}`);
   
   const headers = new Headers(options.headers);
   headers.set("Authorization", `Bearer ${pat}`);
@@ -16,6 +19,8 @@ async function fetchJira(url: string, path: string, pat: string, options: Reques
     ...options,
     headers,
   });
+
+  console.log(`📥 [JIRA Response] ${method} -> ${targetUrl} [Status: ${response.status}]`);
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "Unknown error");
