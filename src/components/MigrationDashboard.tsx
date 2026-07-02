@@ -40,12 +40,12 @@ import { cn } from "@/lib/utils";
 
 const typeMeta: Record<
   IssueType,
-  { icon: React.ComponentType<{ className?: string }>; color: string; ring: string }
+  { icon: React.ComponentType<{ className?: string }>; color: string }
 > = {
-  Bug: { icon: Bug, color: "text-[oklch(var(--bug))]", ring: "bg-[color:var(--bug)]/10" },
-  Story: { icon: BookOpen, color: "text-[oklch(var(--story))]", ring: "bg-[color:var(--story)]/10" },
-  Task: { icon: CheckSquare, color: "text-[oklch(var(--task))]", ring: "bg-[color:var(--task)]/10" },
-  Epic: { icon: Zap, color: "text-[oklch(var(--epic))]", ring: "bg-[color:var(--epic)]/10" },
+  Bug: { icon: Bug, color: "text-[color:var(--bug)]" },
+  Story: { icon: BookOpen, color: "text-[color:var(--story)]" },
+  Task: { icon: CheckSquare, color: "text-[color:var(--task)]" },
+  Epic: { icon: Zap, color: "text-[color:var(--epic)]" },
 };
 
 export function MigrationDashboard() {
