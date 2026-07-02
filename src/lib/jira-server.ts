@@ -1,4 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
+import { z } from "zod";
 import { type JiraConfig, type JiraIssue } from "./jira-types";
 
 // Helper to make requests to JIRA API
@@ -24,8 +25,18 @@ async function fetchJira(url: string, path: string, pat: string, options: Reques
   return response.json();
 }
 
+const jiraConfigSchema = z.object({
+  url: z.string(),
+  pat: z.string(),
+});
+
 export const searchJiraIssuesFn = createServerFn({ method: "POST" })
-  .validator((data: { config: JiraConfig; jql: string }) => data)
+  .validator(
+    z.object({
+      config: jiraConfigSchema,
+      jql: z.string(),
+    })
+  )
   .handler(async ({ data }) => {
     const { config, jql } = data;
     
@@ -70,7 +81,11 @@ export const searchJiraIssuesFn = createServerFn({ method: "POST" })
   });
 
 export const getJiraProjectsFn = createServerFn({ method: "POST" })
-  .validator((data: { config: JiraConfig }) => data)
+  .validator(
+    z.object({
+      config: jiraConfigSchema,
+    })
+  )
   .handler(async ({ data }) => {
     const { config } = data;
     try {
@@ -88,7 +103,14 @@ export const getJiraProjectsFn = createServerFn({ method: "POST" })
   });
 
 export const migrateJiraIssueFn = createServerFn({ method: "POST" })
-  .validator((data: { externalConfig: JiraConfig; internalConfig: JiraConfig; issueId: string; targetProjectKey: string }) => data)
+  .validator(
+    z.object({
+      externalConfig: jiraConfigSchema,
+      internalConfig: jiraConfigSchema,
+      issueId: z.string(),
+      targetProjectKey: z.string(),
+    })
+  )
   .handler(async ({ data }) => {
     const { externalConfig, internalConfig, issueId, targetProjectKey } = data;
 
