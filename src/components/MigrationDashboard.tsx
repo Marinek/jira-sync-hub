@@ -10,7 +10,11 @@ import {
   CheckCircle2,
   History,
   AlertTriangle,
-  Settings,
+  Edit2,
+  Trash2,
+  Link2,
+  X,
+  Check,
   RefreshCw,
 } from "lucide-react";
 
@@ -314,6 +318,45 @@ export function MigrationDashboard() {
     await executeMigration(targetIssueId, selectedMappedType);
   };
 
+  const handleUpdateMapping = (issueId: string, newInternalId: string | null) => {
+    // 1. Update localStorage
+    const localMappingStr = localStorage.getItem("jira_sync_migration_mapping");
+    const mappings = localMappingStr ? JSON.parse(localMappingStr) : {};
+    
+    if (newInternalId) {
+      mappings[issueId] = newInternalId.trim().toUpperCase();
+    } else {
+      delete mappings[issueId];
+    }
+    localStorage.setItem("jira_sync_migration_mapping", JSON.stringify(mappings));
+
+    // 2. Update state issues
+    setIssues((prev) =>
+      prev.map((i) => {
+        if (i.id === issueId) {
+          if (newInternalId) {
+            return {
+              ...i,
+              migrationStatus: "migrated" as const,
+              previouslyMigrated: true,
+              internalId: newInternalId.trim().toUpperCase(),
+            };
+          } else {
+            return {
+              ...i,
+              migrationStatus: "pending" as const,
+              previouslyMigrated: false,
+              internalId: undefined,
+            };
+          }
+        }
+        return i;
+      })
+    );
+
+    toast.success(newInternalId ? `Mapped ${issueId} to ${newInternalId.trim().toUpperCase()}` : `Removed mapping for ${issueId}`);
+  };
+
   const stats = useMemo(() => {
     const migrated = issues.filter((i) => i.migrationStatus === "migrated").length;
     const pending = issues.filter((i) => i.migrationStatus === "pending").length;
@@ -494,6 +537,7 @@ export function MigrationDashboard() {
                 key={issue.id}
                 issue={issue}
                 onMigrate={handleMigration}
+                onUpdateMapping={handleUpdateMapping}
                 internalJiraUrl={config.internalJira?.url}
               />
             ))}
@@ -578,17 +622,40 @@ function Stat({
 function IssueRow({
   issue,
   onMigrate,
+  onUpdateMapping,
   internalJiraUrl,
 }: {
   issue: JiraIssue;
   onMigrate: (id: string) => void;
+  onUpdateMapping: (issueId: string, newInternalId: string | null) => void;
   internalJiraUrl?: string;
 }) {
   const meta = typeMeta[issue.type] || typeMeta["Task"];
   const Icon = meta.icon;
 
+  const [isEditing, setIsEditing] = useState(false);
+  const [manualId, setManualId] = useState(issue.internalId || "");
+
+  useEffect(() => {
+    setManualId(issue.internalId || "");
+  }, [issue.internalId]);
+
+  const handleSave = () => {
+    if (!manualId.trim()) {
+      toast.error("Please enter a valid JIRA issue key");
+      return;
+    }
+    onUpdateMapping(issue.id, manualId.trim().toUpperCase());
+    setIsEditing(false);
+  };
+
+  const handleCancel = () => {
+    setManualId(issue.internalId || "");
+    setIsEditing(false);
+  };
+
   return (
-    <div className="grid grid-cols-[110px_1fr_180px_110px_120px_190px] items-center gap-3 border-b px-4 py-2.5 text-sm transition-colors last:border-b-0 hover:bg-muted/30">
+    <div className="grid grid-cols-[110px_1fr_180px_110px_120px_190px] items-center gap-3 border-b px-4 py-2.5 text-sm transition-colors last:border-b-0 hover:bg-muted/30 group">
       <div className="flex items-center gap-1.5">
         <span className="rounded border bg-background px-1.5 py-0.5 font-mono text-xs font-medium text-foreground">
           {issue.id}
@@ -624,7 +691,37 @@ function IssueRow({
       </div>
 
       <div className="flex justify-end">
-        <MigrationButton issue={issue} onMigrate={onMigrate} internalJiraUrl={internalJiraUrl} />
+        {isEditing ? (
+          <div className="flex items-center gap-1">
+            <Input
+              value={manualId}
+              onChange={(e) => setManualId(e.target.value)}
+              placeholder="INT-123"
+              className="h-7 w-24 text-xs font-mono uppercase px-2 bg-background"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleSave();
+                if (e.key === "Escape") handleCancel();
+              }}
+              autoFocus
+            />
+            <Button size="icon" variant="ghost" className="h-7 w-7 text-green-600 hover:bg-green-50" onClick={handleSave}>
+              <Check className="h-3.5 w-3.5" />
+            </Button>
+            <Button size="icon" variant="ghost" className="h-7 w-7 text-muted-foreground hover:bg-muted" onClick={handleCancel}>
+              <X className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-1.5">
+            <MigrationButton
+              issue={issue}
+              onMigrate={onMigrate}
+              internalJiraUrl={internalJiraUrl}
+              onStartEdit={() => setIsEditing(true)}
+              onDeleteMapping={() => onUpdateMapping(issue.id, null)}
+            />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -634,10 +731,14 @@ function MigrationButton({
   issue,
   onMigrate,
   internalJiraUrl,
+  onStartEdit,
+  onDeleteMapping,
 }: {
   issue: JiraIssue;
   onMigrate: (id: string) => void;
   internalJiraUrl?: string;
+  onStartEdit: () => void;
+  onDeleteMapping: () => void;
 }) {
   if (issue.migrationStatus === "migrated") {
     const issueLink = internalJiraUrl && issue.internalId
@@ -645,24 +746,46 @@ function MigrationButton({
       : null;
 
     return (
-      <Badge
-        variant="outline"
-        className="gap-1.5 border-[color:var(--success)]/30 bg-[color:var(--success)]/10 text-[color:var(--success)] font-medium"
-      >
-        <CheckCircle2 className="h-3.5 w-3.5" />
-        {issueLink ? (
-          <a
-            href={issueLink}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="hover:underline flex items-center"
+      <div className="flex items-center gap-1">
+        <Badge
+          variant="outline"
+          className="gap-1.5 border-[color:var(--success)]/30 bg-[color:var(--success)]/10 text-[color:var(--success)] font-medium"
+        >
+          <CheckCircle2 className="h-3.5 w-3.5" />
+          {issueLink ? (
+            <a
+              href={issueLink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hover:underline flex items-center animate-fade-in"
+            >
+              Migrated · {issue.internalId}
+            </a>
+          ) : (
+            <span>Migrated{issue.internalId ? ` · ${issue.internalId}` : ""}</span>
+          )}
+        </Badge>
+        <div className="flex opacity-0 group-hover:opacity-100 transition-opacity gap-0.5">
+          <Button
+            size="icon"
+            variant="ghost"
+            className="h-6 w-6 text-muted-foreground hover:bg-muted"
+            onClick={onStartEdit}
+            title="Edit Mapping"
           >
-            Migrated · {issue.internalId}
-          </a>
-        ) : (
-          <span>Migrated{issue.internalId ? ` · ${issue.internalId}` : ""}</span>
-        )}
-      </Badge>
+            <Edit2 className="h-3 w-3" />
+          </Button>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="h-6 w-6 text-destructive hover:bg-destructive/10"
+            onClick={onDeleteMapping}
+            title="Remove Mapping"
+          >
+            <Trash2 className="h-3 w-3" />
+          </Button>
+        </div>
+      </div>
     );
   }
 
@@ -677,26 +800,48 @@ function MigrationButton({
 
   if (issue.migrationStatus === "failed") {
     return (
-      <Button
-        size="sm"
-        variant="outline"
-        onClick={() => onMigrate(issue.id)}
-        className="h-7 gap-1.5 border-destructive/30 text-xs text-destructive hover:bg-destructive/10"
-      >
-        <AlertTriangle className="h-3.5 w-3.5" />
-        Retry
-      </Button>
+      <div className="flex items-center gap-1.5">
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => onMigrate(issue.id)}
+          className="h-7 gap-1.5 border-destructive/30 text-xs text-destructive hover:bg-destructive/10"
+        >
+          <AlertTriangle className="h-3.5 w-3.5" />
+          Retry
+        </Button>
+        <Button
+          size="icon"
+          variant="outline"
+          className="h-7 w-7 text-muted-foreground hover:text-foreground opacity-0 group-hover:opacity-100 transition-opacity"
+          onClick={onStartEdit}
+          title="Manually link existing issue"
+        >
+          <Link2 className="h-3.5 w-3.5" />
+        </Button>
+      </div>
     );
   }
 
   return (
-    <Button
-      size="sm"
-      onClick={() => onMigrate(issue.id)}
-      className="h-7 gap-1.5 text-xs"
-    >
-      <ArrowRightLeft className="h-3.5 w-3.5" />
-      Migrate
-    </Button>
+    <div className="flex items-center gap-1.5">
+      <Button
+        size="sm"
+        onClick={() => onMigrate(issue.id)}
+        className="h-7 gap-1.5 text-xs"
+      >
+        <ArrowRightLeft className="h-3.5 w-3.5" />
+        Migrate
+      </Button>
+      <Button
+        size="icon"
+        variant="outline"
+        className="h-7 w-7 text-muted-foreground hover:text-foreground opacity-0 group-hover:opacity-100 transition-opacity"
+        onClick={onStartEdit}
+        title="Manually link existing issue"
+      >
+        <Link2 className="h-3.5 w-3.5" />
+      </Button>
+    </div>
   );
 }
