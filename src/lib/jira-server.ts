@@ -107,6 +107,30 @@ export const getJiraProjectsFn = createServerFn({ method: "POST" })
     }
   });
 
+export const getJiraProjectDetailsFn = createServerFn({ method: "POST" })
+  .validator(
+    z.object({
+      config: jiraConfigSchema,
+      projectKey: z.string(),
+    })
+  )
+  .handler(async ({ data }) => {
+    const { config, projectKey } = data;
+    try {
+      const result = await fetchJira(config.url, `/rest/api/2/project/${projectKey}`, config.pat);
+      const issueTypes = (result.issueTypes || []).map((t: any) => ({
+        id: t.id,
+        name: t.name,
+        description: t.description,
+        subtask: t.subtask,
+      }));
+      return { key: result.key, name: result.name, issueTypes };
+    } catch (error: any) {
+      console.error("Error in getJiraProjectDetailsFn:", error);
+      throw error;
+    }
+  });
+
 export const migrateJiraIssueFn = createServerFn({ method: "POST" })
   .validator(
     z.object({
@@ -114,10 +138,11 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
       internalConfig: jiraConfigSchema,
       issueId: z.string(),
       targetProjectKey: z.string(),
+      targetIssueTypeName: z.string().optional(),
     })
   )
   .handler(async ({ data }) => {
-    const { externalConfig, internalConfig, issueId, targetProjectKey } = data;
+    const { externalConfig, internalConfig, issueId, targetProjectKey, targetIssueTypeName } = data;
 
     try {
       // 1. Fetch issue details from external JIRA
@@ -133,8 +158,9 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
           summary: extIssue.fields.summary,
           description: `Migrated from ${issueId} (${externalConfig.url}/browse/${issueId})\n\n${extIssue.fields.description || ""}`,
           issuetype: {
-            name: extIssue.fields.issuetype?.name || "Task",
+            name: targetIssueTypeName || extIssue.fields.issuetype?.name || "Task",
           },
+          labels: [issueId],
         },
       };
 
@@ -148,6 +174,52 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
           body: JSON.stringify(createBody),
         }
       );
+
+      // 4. Copy attachments if present
+      const attachments = extIssue.fields.attachment || [];
+      if (attachments.length > 0) {
+        console.log(`📎 Found ${attachments.length} attachments to copy for issue ${issueId}`);
+        for (const att of attachments) {
+          try {
+            console.log(`📎 Copying attachment: ${att.filename} (${att.size} bytes)`);
+            
+            // Download from external
+            const downloadRes = await fetch(att.content, {
+              headers: {
+                Authorization: `Bearer ${externalConfig.pat}`,
+              },
+            });
+            if (!downloadRes.ok) {
+              throw new Error(`Failed to download: ${downloadRes.statusText}`);
+            }
+            const blob = await downloadRes.blob();
+
+            // Prepare upload FormData
+            const uploadForm = new FormData();
+            uploadForm.append("file", blob, att.filename);
+
+            const uploadUrl = `${internalConfig.url.replace(/\/$/, "")}/rest/api/2/issue/${createResult.key}/attachments`;
+            
+            const uploadRes = await fetch(uploadUrl, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${internalConfig.pat}`,
+                "X-Atlassian-Token": "no-check", // Mandatory for JIRA attachment endpoint
+              },
+              body: uploadForm,
+            });
+
+            if (!uploadRes.ok) {
+              const errBody = await uploadRes.text().catch(() => "");
+              console.error(`Failed to upload attachment ${att.filename}:`, errBody);
+            } else {
+              console.log(`✓ Copied attachment: ${att.filename}`);
+            }
+          } catch (attErr: any) {
+            console.error(`Error copying attachment ${att.filename}:`, attErr);
+          }
+        }
+      }
 
       return {
         internalId: createResult.key, // returns something like "INT-1234"

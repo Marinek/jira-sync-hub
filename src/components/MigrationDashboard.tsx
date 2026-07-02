@@ -30,10 +30,18 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog";
 import { toast } from "sonner";
 import { formatRelative, mockIssues } from "@/lib/jira-mock";
 import { type IssueType, type JiraIssue, type JiraProject } from "@/lib/jira-types";
-import { searchJiraIssuesFn, migrateJiraIssueFn, getJiraProjectsFn } from "@/lib/jira-server";
+import { searchJiraIssuesFn, migrateJiraIssueFn, getJiraProjectsFn, getJiraProjectDetailsFn } from "@/lib/jira-server";
 import { cn } from "@/lib/utils";
 import { SettingsModal } from "@/components/SettingsModal";
 import { useJiraConfig } from "@/hooks/useJiraConfig";
@@ -62,6 +70,42 @@ export function MigrationDashboard() {
   const [intProjects, setIntProjects] = useState<JiraProject[]>([]);
   const [selectedExtProjectKey, setSelectedExtProjectKey] = useState<string>("");
   const [selectedIntProjectKey, setSelectedIntProjectKey] = useState<string>("");
+
+  // Target project issue types state
+  const [targetIssueTypes, setTargetIssueTypes] = useState<{ id: string; name: string }[]>([]);
+  const [isLoadingTargetTypes, setIsLoadingTargetTypes] = useState(false);
+
+  // Mapping dialog state
+  const [mappingDialogOpen, setMappingDialogOpen] = useState(false);
+  const [mappingIssue, setMappingIssue] = useState<JiraIssue | null>(null);
+  const [selectedMappedType, setSelectedMappedType] = useState<string>("");
+
+  // Fetch target project details (issue types) when target project changes
+  useEffect(() => {
+    if (!isFullyConfigured || !selectedIntProjectKey) {
+      setTargetIssueTypes([]);
+      return;
+    }
+
+    const fetchTargetDetails = async () => {
+      setIsLoadingTargetTypes(true);
+      try {
+        const result = await getJiraProjectDetailsFn({
+          data: {
+            config: config.internalJira,
+            projectKey: selectedIntProjectKey,
+          },
+        });
+        setTargetIssueTypes(result.issueTypes);
+      } catch (err: any) {
+        console.error("Failed to load target project issue types:", err);
+      } finally {
+        setIsLoadingTargetTypes(false);
+      }
+    };
+
+    fetchTargetDetails();
+  }, [isFullyConfigured, config, selectedIntProjectKey]);
 
   // Fetch projects from both JIRA instances once authenticated
   useEffect(() => {
@@ -162,12 +206,7 @@ export function MigrationDashboard() {
     });
   }, [issues, query, typeFilter]);
 
-  const handleMigration = async (issueId: string) => {
-    if (!isFullyConfigured || !selectedIntProjectKey) {
-      toast.error("Please configure JIRA credentials and select a target project first.");
-      return;
-    }
-
+  const executeMigration = async (issueId: string, mappedType?: string) => {
     setIssues((prev) =>
       prev.map((i) => (i.id === issueId ? { ...i, migrationStatus: "migrating" } : i)),
     );
@@ -179,6 +218,7 @@ export function MigrationDashboard() {
           internalConfig: config.internalJira,
           issueId,
           targetProjectKey: selectedIntProjectKey,
+          targetIssueTypeName: mappedType,
         }
       });
 
@@ -204,6 +244,74 @@ export function MigrationDashboard() {
       );
       toast.error(`Failed to migrate ${issueId}: ${err.message}`);
     }
+  };
+
+  const handleMigration = async (issueId: string) => {
+    if (!isFullyConfigured || !selectedIntProjectKey) {
+      toast.error("Please configure JIRA credentials and select a target project first.");
+      return;
+    }
+
+    const issue = issues.find((i) => i.id === issueId);
+    if (!issue) return;
+
+    // Check if issue type exists in target project
+    const typeExists = targetIssueTypes.some(
+      (t) => t.name.toLowerCase() === issue.type.toLowerCase()
+    );
+
+    if (typeExists) {
+      // Migrate directly using the original issue type name
+      const matchingType = targetIssueTypes.find(
+        (t) => t.name.toLowerCase() === issue.type.toLowerCase()
+      )?.name;
+      await executeMigration(issueId, matchingType);
+    } else {
+      // Check for saved project-specific mapping
+      const savedMappingsStr = localStorage.getItem(`jira_type_mapping_${selectedIntProjectKey}`);
+      const savedMappings = savedMappingsStr ? JSON.parse(savedMappingsStr) : {};
+      const savedMappedType = savedMappings[issue.type];
+      
+      const mappingValid =
+        savedMappedType &&
+        targetIssueTypes.some((t) => t.name.toLowerCase() === savedMappedType.toLowerCase());
+
+      if (mappingValid) {
+        // Reuse mapping automatically
+        const validTypeName = targetIssueTypes.find(
+          (t) => t.name.toLowerCase() === savedMappedType.toLowerCase()
+        )?.name;
+        await executeMigration(issueId, validTypeName);
+      } else {
+        // Prompt user to choose target mapping type
+        setMappingIssue(issue);
+        const defaultTargetType =
+          targetIssueTypes.find((t) => t.name === "Task")?.name ||
+          targetIssueTypes[0]?.name ||
+          "";
+        setSelectedMappedType(defaultTargetType);
+        setMappingDialogOpen(true);
+      }
+    }
+  };
+
+  const handleConfirmMapping = async () => {
+    if (!mappingIssue || !selectedMappedType) return;
+    
+    // Save to localStorage under project-specific key
+    const savedMappingsStr = localStorage.getItem(`jira_type_mapping_${selectedIntProjectKey}`);
+    const savedMappings = savedMappingsStr ? JSON.parse(savedMappingsStr) : {};
+    savedMappings[mappingIssue.type] = selectedMappedType;
+    localStorage.setItem(
+      `jira_type_mapping_${selectedIntProjectKey}`,
+      JSON.stringify(savedMappings)
+    );
+
+    setMappingDialogOpen(false);
+    const targetIssueId = mappingIssue.id;
+    setMappingIssue(null);
+
+    await executeMigration(targetIssueId, selectedMappedType);
   };
 
   const stats = useMemo(() => {
@@ -396,6 +504,44 @@ export function MigrationDashboard() {
           </p>
         </main>
       </div>
+
+      <Dialog open={mappingDialogOpen} onOpenChange={setMappingDialogOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Map Issue Type</DialogTitle>
+            <DialogDescription>
+              The issue type <strong>{mappingIssue?.type}</strong> does not exist in target project <strong>{selectedIntProjectKey}</strong>. Please map it to one of the available target issue types.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Target Issue Type</label>
+              <Select value={selectedMappedType} onValueChange={setSelectedMappedType}>
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="Select target issue type" />
+                </SelectTrigger>
+                <SelectContent>
+                  {targetIssueTypes.map((t) => (
+                    <SelectItem key={t.id} value={t.name}>
+                      {t.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setMappingDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={handleConfirmMapping}>
+              Confirm & Migrate
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </TooltipProvider>
   );
 }
