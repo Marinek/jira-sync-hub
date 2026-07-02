@@ -438,7 +438,7 @@ function IssueRow({
   onMigrate: (id: string) => void;
   internalJiraUrl?: string;
 }) {
-  const meta = typeMeta[issue.type];
+  const meta = typeMeta[issue.type] || typeMeta["Task"];
   const Icon = meta.icon;
 
   return (
