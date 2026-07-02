@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import {
   Bug,
   BookOpen,
@@ -10,6 +10,8 @@ import {
   CheckCircle2,
   History,
   AlertTriangle,
+  Settings,
+  RefreshCw,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -29,14 +31,12 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { toast } from "sonner";
-import {
-  formatRelative,
-  migrateIssueApi,
-  mockIssues,
-  type IssueType,
-  type JiraIssue,
-} from "@/lib/jira-mock";
+import { formatRelative, mockIssues } from "@/lib/jira-mock";
+import { type IssueType, type JiraIssue, type JiraProject } from "@/lib/jira-types";
+import { searchJiraIssuesFn, migrateJiraIssueFn, getJiraProjectsFn } from "@/lib/jira-server";
 import { cn } from "@/lib/utils";
+import { SettingsModal } from "@/components/SettingsModal";
+import { useJiraConfig } from "@/hooks/useJiraConfig";
 
 const typeMeta: Record<
   IssueType,
@@ -49,15 +49,106 @@ const typeMeta: Record<
 };
 
 export function MigrationDashboard() {
-  const [issues, setIssues] = useState<JiraIssue[]>(mockIssues);
+  const { isFullyConfigured, config } = useJiraConfig();
+  const [issues, setIssues] = useState<JiraIssue[]>([]);
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<string>("all");
-  const [assigneeFilter, setAssigneeFilter] = useState<string>("all");
+  const [assigneeFilter, setAssigneeFilter] = useState<string>("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [refreshTrigger, setRefreshTrigger] = useState(0);
 
-  const assignees = useMemo(
-    () => Array.from(new Set(issues.map((i) => i.assignee.name))).sort(),
-    [issues],
-  );
+  // Projects list state
+  const [extProjects, setExtProjects] = useState<JiraProject[]>([]);
+  const [intProjects, setIntProjects] = useState<JiraProject[]>([]);
+  const [selectedExtProjectKey, setSelectedExtProjectKey] = useState<string>("");
+  const [selectedIntProjectKey, setSelectedIntProjectKey] = useState<string>("");
+
+  // Fetch projects from both JIRA instances once authenticated
+  useEffect(() => {
+    if (!isFullyConfigured) {
+      setExtProjects([]);
+      setIntProjects([]);
+      setSelectedExtProjectKey("");
+      setSelectedIntProjectKey("");
+      return;
+    }
+
+    const fetchProjects = async () => {
+      try {
+        const [extRes, intRes] = await Promise.all([
+          getJiraProjectsFn({ config: config.externalJira }),
+          getJiraProjectsFn({ config: config.internalJira }),
+        ]);
+
+        setExtProjects(extRes.projects);
+        setIntProjects(intRes.projects);
+
+        if (extRes.projects.length > 0) {
+          setSelectedExtProjectKey(extRes.projects[0].key);
+        }
+        if (intRes.projects.length > 0) {
+          setSelectedIntProjectKey(intRes.projects[0].key);
+        }
+      } catch (err: any) {
+        console.error(err);
+        toast.error("Failed to load JIRA projects: " + err.message);
+      }
+    };
+
+    fetchProjects();
+  }, [isFullyConfigured, config]);
+
+  // Load issues from selected JIRA project
+  useEffect(() => {
+    if (!isFullyConfigured || !selectedExtProjectKey) {
+      setIssues([]);
+      return;
+    }
+
+    const fetchLiveIssues = async () => {
+      setIsLoading(true);
+      try {
+        // Construct JQL dynamically with selected project key
+        let jql = `project = "${selectedExtProjectKey}" AND statusCategory != Done`;
+        
+        if (assigneeFilter.trim() !== "") {
+          const cleanAssignee = assigneeFilter.trim();
+          jql += ` AND assignee = "${cleanAssignee}"`;
+        }
+
+        const result = await searchJiraIssuesFn({
+          config: config.externalJira,
+          jql,
+        });
+
+        // Merge with local migrations mappings
+        const localMappingStr = localStorage.getItem("jira_sync_migration_mapping");
+        const mappings = localMappingStr ? JSON.parse(localMappingStr) : {};
+
+        const mappedIssues = result.issues.map((issue) => {
+          if (mappings[issue.id]) {
+            return {
+              ...issue,
+              migrationStatus: "migrated" as const,
+              previouslyMigrated: true,
+              internalId: mappings[issue.id],
+            };
+          }
+          return issue;
+        });
+
+        setIssues(mappedIssues);
+      } catch (err: any) {
+        console.error(err);
+        toast.error("Failed to query JIRA issues: " + err.message);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    const timer = setTimeout(fetchLiveIssues, 500);
+    return () => clearTimeout(timer);
+  }, [isFullyConfigured, config, assigneeFilter, selectedExtProjectKey, refreshTrigger]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -65,20 +156,34 @@ export function MigrationDashboard() {
       if (q && !i.title.toLowerCase().includes(q) && !i.id.toLowerCase().includes(q))
         return false;
       if (typeFilter !== "all" && i.type !== typeFilter) return false;
-      if (assigneeFilter !== "all" && i.assignee.name !== assigneeFilter) return false;
       return true;
     });
-  }, [issues, query, typeFilter, assigneeFilter]);
+  }, [issues, query, typeFilter]);
 
-  // === Backend integration point ==========================================
-  // Replace `migrateIssueApi` inside this handler with your real endpoint.
-  // Keep the state transitions the same so the UI stays consistent.
   const handleMigration = async (issueId: string) => {
+    if (!isFullyConfigured || !selectedIntProjectKey) {
+      toast.error("Please configure JIRA credentials and select a target project first.");
+      return;
+    }
+
     setIssues((prev) =>
       prev.map((i) => (i.id === issueId ? { ...i, migrationStatus: "migrating" } : i)),
     );
+
     try {
-      const { internalId } = await migrateIssueApi(issueId);
+      const { internalId } = await migrateJiraIssueFn({
+        externalConfig: config.externalJira,
+        internalConfig: config.internalJira,
+        issueId,
+        targetProjectKey: selectedIntProjectKey,
+      });
+
+      // Update local storage mappings
+      const localMappingStr = localStorage.getItem("jira_sync_migration_mapping");
+      const mappings = localMappingStr ? JSON.parse(localMappingStr) : {};
+      mappings[issueId] = internalId;
+      localStorage.setItem("jira_sync_migration_mapping", JSON.stringify(mappings));
+
       setIssues((prev) =>
         prev.map((i) =>
           i.id === issueId
@@ -86,15 +191,16 @@ export function MigrationDashboard() {
             : i,
         ),
       );
-      toast.success(`Migrated ${issueId} → ${internalId}`);
-    } catch (err) {
+
+      toast.success(`Successfully migrated ${issueId} → ${internalId}`);
+    } catch (err: any) {
+      console.error(err);
       setIssues((prev) =>
         prev.map((i) => (i.id === issueId ? { ...i, migrationStatus: "failed" } : i)),
       );
-      toast.error(`Failed to migrate ${issueId}`);
+      toast.error(`Failed to migrate ${issueId}: ${err.message}`);
     }
   };
-  // ========================================================================
 
   const stats = useMemo(() => {
     const migrated = issues.filter((i) => i.migrationStatus === "migrated").length;
@@ -117,16 +223,82 @@ export function MigrationDashboard() {
                 Migration Dashboard
               </h1>
             </div>
-            <div className="flex gap-6 text-right">
-              <Stat label="Total" value={stats.total} />
-              <Stat label="Migrated" value={stats.migrated} tone="success" />
-              <Stat label="Pending" value={stats.pending} tone="warning" />
-              {stats.failed > 0 && <Stat label="Failed" value={stats.failed} tone="destructive" />}
+            <div className="flex items-center gap-6">
+              <div className="flex gap-6 text-right">
+                <Stat label="Total" value={stats.total} />
+                <Stat label="Migrated" value={stats.migrated} tone="success" />
+                <Stat label="Pending" value={stats.pending} tone="warning" />
+                {stats.failed > 0 && <Stat label="Failed" value={stats.failed} tone="destructive" />}
+              </div>
+              <div className="flex items-center gap-3 border-l pl-6">
+                <div className="flex flex-col items-end gap-0.5">
+                  <div className="flex items-center gap-1.5 text-xs">
+                    <span className={cn("h-2 w-2 rounded-full", isFullyConfigured ? "bg-green-500 animate-pulse" : "bg-red-500")} />
+                    <span className="font-medium text-muted-foreground">
+                      {isFullyConfigured ? "Connected" : "Not Configured"}
+                    </span>
+                  </div>
+                  {isFullyConfigured && selectedExtProjectKey && selectedIntProjectKey && (
+                    <span className="text-[10px] text-muted-foreground font-mono">
+                      {selectedExtProjectKey} → {selectedIntProjectKey}
+                    </span>
+                  )}
+                </div>
+                <SettingsModal />
+              </div>
             </div>
           </div>
         </header>
 
         <main className="mx-auto max-w-7xl px-6 py-6">
+          {/* JIRA connection configuration notice banner */}
+          {!isFullyConfigured && (
+            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between rounded-lg border border-yellow-500/20 bg-yellow-500/5 px-4 py-3 text-sm text-yellow-600 dark:text-yellow-400">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 text-yellow-500 shrink-0" />
+                <span>No JIRA connection configured. Please configure your JIRA credentials in Settings to query and sync real issues.</span>
+              </div>
+              <SettingsModal trigger={<Button variant="link" size="sm" className="h-auto p-0 font-semibold text-yellow-600 dark:text-yellow-400 hover:underline">Configure now →</Button>} />
+            </div>
+          )}
+
+          {/* Project & Connection Selectors */}
+          {isFullyConfigured && (
+            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center rounded-lg border bg-muted/20 p-3 text-sm">
+              <div className="flex flex-1 flex-col gap-1.5 sm:flex-row sm:items-center">
+                <span className="font-semibold text-muted-foreground whitespace-nowrap">Source Project:</span>
+                <Select value={selectedExtProjectKey} onValueChange={setSelectedExtProjectKey}>
+                  <SelectTrigger className="w-full sm:w-64 bg-background">
+                    <SelectValue placeholder="Select external project" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {extProjects.map((project) => (
+                      <SelectItem key={project.key} value={project.key}>
+                        {project.name} ({project.key})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="flex flex-1 flex-col gap-1.5 sm:flex-row sm:items-center sm:justify-end">
+                <span className="font-semibold text-muted-foreground whitespace-nowrap">Target Project:</span>
+                <Select value={selectedIntProjectKey} onValueChange={setSelectedIntProjectKey}>
+                  <SelectTrigger className="w-full sm:w-64 bg-background">
+                    <SelectValue placeholder="Select target project" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {intProjects.map((project) => (
+                      <SelectItem key={project.key} value={project.key}>
+                        {project.name} ({project.key})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          )}
+
           {/* Filter bar */}
           <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center">
             <div className="relative flex-1">
@@ -150,19 +322,28 @@ export function MigrationDashboard() {
                 <SelectItem value="Epic">Epic</SelectItem>
               </SelectContent>
             </Select>
-            <Select value={assigneeFilter} onValueChange={setAssigneeFilter}>
-              <SelectTrigger className="w-full sm:w-52">
-                <SelectValue placeholder="Assignee" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All assignees</SelectItem>
-                {assignees.map((a) => (
-                  <SelectItem key={a} value={a}>
-                    {a}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            
+            <div className="relative w-full sm:w-56">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={assigneeFilter}
+                onChange={(e) => setAssigneeFilter(e.target.value)}
+                placeholder="Assignee name (e.g. Marcus Chen)..."
+                className="pl-9"
+              />
+            </div>
+
+            {isFullyConfigured && (
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={() => setRefreshTrigger((prev) => prev + 1)}
+                disabled={isLoading}
+                title="Refresh issues"
+              >
+                <RefreshCw className={cn("h-4 w-4", isLoading && "animate-spin")} />
+              </Button>
+            )}
           </div>
 
           {/* Table */}
@@ -176,14 +357,33 @@ export function MigrationDashboard() {
               <div className="text-right">Action</div>
             </div>
 
-            {filtered.length === 0 && (
-              <div className="p-10 text-center text-sm text-muted-foreground">
-                No issues match your filters.
+            {isLoading && (
+              <div className="p-12 flex flex-col items-center justify-center gap-2 text-sm text-muted-foreground bg-muted/5">
+                <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                <span>Fetching live JIRA issues...</span>
               </div>
             )}
 
-            {filtered.map((issue) => (
-              <IssueRow key={issue.id} issue={issue} onMigrate={handleMigration} />
+            {!isFullyConfigured && (
+              <div className="p-12 text-center text-sm text-muted-foreground flex flex-col items-center gap-2">
+                <AlertTriangle className="h-6 w-6 text-yellow-500" />
+                <span>No JIRA connection configured. Please configure settings to load issues.</span>
+              </div>
+            )}
+
+            {isFullyConfigured && !isLoading && filtered.length === 0 && (
+              <div className="p-10 text-center text-sm text-muted-foreground">
+                No issues match your filters or search criteria.
+              </div>
+            )}
+
+            {!isLoading && filtered.map((issue) => (
+              <IssueRow
+                key={issue.id}
+                issue={issue}
+                onMigrate={handleMigration}
+                internalJiraUrl={config.internalJira?.url}
+              />
             ))}
           </div>
 
@@ -228,9 +428,11 @@ function Stat({
 function IssueRow({
   issue,
   onMigrate,
+  internalJiraUrl,
 }: {
   issue: JiraIssue;
   onMigrate: (id: string) => void;
+  internalJiraUrl?: string;
 }) {
   const meta = typeMeta[issue.type];
   const Icon = meta.icon;
@@ -272,7 +474,7 @@ function IssueRow({
       </div>
 
       <div className="flex justify-end">
-        <MigrationButton issue={issue} onMigrate={onMigrate} />
+        <MigrationButton issue={issue} onMigrate={onMigrate} internalJiraUrl={internalJiraUrl} />
       </div>
     </div>
   );
@@ -281,18 +483,35 @@ function IssueRow({
 function MigrationButton({
   issue,
   onMigrate,
+  internalJiraUrl,
 }: {
   issue: JiraIssue;
   onMigrate: (id: string) => void;
+  internalJiraUrl?: string;
 }) {
   if (issue.migrationStatus === "migrated") {
+    const issueLink = internalJiraUrl && issue.internalId
+      ? `${internalJiraUrl.replace(/\/$/, "")}/browse/${issue.internalId}`
+      : null;
+
     return (
       <Badge
         variant="outline"
         className="gap-1.5 border-[color:var(--success)]/30 bg-[color:var(--success)]/10 text-[color:var(--success)] font-medium"
       >
         <CheckCircle2 className="h-3.5 w-3.5" />
-        Migrated{issue.internalId ? ` · ${issue.internalId}` : ""}
+        {issueLink ? (
+          <a
+            href={issueLink}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hover:underline flex items-center"
+          >
+            Migrated · {issue.internalId}
+          </a>
+        ) : (
+          <span>Migrated{issue.internalId ? ` · ${issue.internalId}` : ""}</span>
+        )}
       </Badge>
     );
   }
