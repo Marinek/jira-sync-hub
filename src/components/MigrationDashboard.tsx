@@ -76,8 +76,8 @@ export function MigrationDashboard() {
     const fetchProjects = async () => {
       try {
         const [extRes, intRes] = await Promise.all([
-          getJiraProjectsFn({ config: config.externalJira }),
-          getJiraProjectsFn({ config: config.internalJira }),
+          getJiraProjectsFn({ data: { config: config.externalJira } }),
+          getJiraProjectsFn({ data: { config: config.internalJira } }),
         ]);
 
         setExtProjects(extRes.projects);
@@ -117,8 +117,10 @@ export function MigrationDashboard() {
         }
 
         const result = await searchJiraIssuesFn({
-          config: config.externalJira,
-          jql,
+          data: {
+            config: config.externalJira,
+            jql,
+          }
         });
 
         // Merge with local migrations mappings
@@ -172,10 +174,12 @@ export function MigrationDashboard() {
 
     try {
       const { internalId } = await migrateJiraIssueFn({
-        externalConfig: config.externalJira,
-        internalConfig: config.internalJira,
-        issueId,
-        targetProjectKey: selectedIntProjectKey,
+        data: {
+          externalConfig: config.externalJira,
+          internalConfig: config.internalJira,
+          issueId,
+          targetProjectKey: selectedIntProjectKey,
+        }
       });
 
       // Update local storage mappings
