@@ -37,14 +37,10 @@ export function useJiraConfig() {
   };
 
   const isConfigured = (jiraConfig: JiraConfig) => {
-    return (
-      jiraConfig.url.trim() !== "" &&
-      jiraConfig.pat.trim() !== ""
-    );
+    return jiraConfig.url.trim() !== "" && jiraConfig.pat.trim() !== "";
   };
 
-  const isFullyConfigured =
-    isConfigured(config.externalJira) && isConfigured(config.internalJira);
+  const isFullyConfigured = isConfigured(config.externalJira) && isConfigured(config.internalJira);
 
   return {
     config,

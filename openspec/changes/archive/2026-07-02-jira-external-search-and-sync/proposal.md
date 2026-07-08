@@ -12,9 +12,11 @@ We want to allow users to search for specific issues on an external Jira instanc
 ## Capabilities
 
 ### New Capabilities
+
 - `jira-sync`: Connection management (external/internal), external issue querying, and migration execution to the internal system.
 
 ### Modified Capabilities
+
 - None
 
 ## Impact

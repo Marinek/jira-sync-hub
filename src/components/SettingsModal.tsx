@@ -101,7 +101,9 @@ export function SettingsModal({ trigger, open, onOpenChange }: SettingsModalProp
         <div className="my-2 flex items-start gap-2.5 rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-3 text-xs text-yellow-600 dark:text-yellow-400">
           <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-yellow-500" />
           <div>
-            <span className="font-semibold">Security Warning:</span> Credentials are stored in plaintext in the browser's <code>localStorage</code>. Make sure you only run this application in a trusted local environment and do not deploy it publicly.
+            <span className="font-semibold">Security Warning:</span> Credentials are stored in
+            plaintext in the browser's <code>localStorage</code>. Make sure you only run this
+            application in a trusted local environment and do not deploy it publicly.
           </div>
         </div>
 

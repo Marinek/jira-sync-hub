@@ -8,8 +8,7 @@ export const Route = createFileRoute("/")({
       { title: "JIRA Migration Dashboard" },
       {
         name: "description",
-        content:
-          "Track and migrate JIRA issues from an external instance to your internal JIRA.",
+        content: "Track and migrate JIRA issues from an external instance to your internal JIRA.",
       },
       { property: "og:title", content: "JIRA Migration Dashboard" },
       {

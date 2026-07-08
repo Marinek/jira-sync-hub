@@ -28,12 +28,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Dialog,
   DialogContent,
@@ -45,7 +40,14 @@ import {
 import { toast } from "sonner";
 import { formatRelative, mockIssues } from "@/lib/jira-mock";
 import { type IssueType, type JiraIssue, type JiraProject } from "@/lib/jira-types";
-import { searchJiraIssuesFn, migrateJiraIssueFn, getJiraProjectsFn, getJiraProjectDetailsFn } from "@/lib/jira-server";
+import {
+  searchJiraIssuesFn,
+  migrateJiraIssueFn,
+  getJiraProjectsFn,
+  getJiraProjectDetailsFn,
+  getMigrationMappingsFn,
+  updateMigrationMappingFn,
+} from "@/lib/jira-server";
 import { cn } from "@/lib/utils";
 import { SettingsModal } from "@/components/SettingsModal";
 import { useJiraConfig } from "@/hooks/useJiraConfig";
@@ -158,7 +160,7 @@ export function MigrationDashboard() {
       try {
         // Construct JQL dynamically with selected project key
         let jql = `project = "${selectedExtProjectKey}" AND statusCategory != Done`;
-        
+
         if (assigneeFilter.trim() !== "") {
           const cleanAssignee = assigneeFilter.trim();
           jql += ` AND assignee = "${cleanAssignee}"`;
@@ -168,12 +170,12 @@ export function MigrationDashboard() {
           data: {
             config: config.externalJira,
             jql,
-          }
+          },
         });
 
-        // Merge with local migrations mappings
-        const localMappingStr = localStorage.getItem("jira_sync_migration_mapping");
-        const mappings = localMappingStr ? JSON.parse(localMappingStr) : {};
+        // Merge with server migrations mappings
+        const mappingsResult = await getMigrationMappingsFn();
+        const mappings = mappingsResult.mappings || {};
 
         const mappedIssues = result.issues.map((issue) => {
           if (mappings[issue.id]) {
@@ -200,11 +202,47 @@ export function MigrationDashboard() {
     return () => clearTimeout(timer);
   }, [isFullyConfigured, config, assigneeFilter, selectedExtProjectKey, refreshTrigger]);
 
+  // Automatic target project selection when source project changes
+  useEffect(() => {
+    if (!isFullyConfigured || !selectedExtProjectKey || intProjects.length === 0) {
+      return;
+    }
+
+    const autoSelectTargetProject = async () => {
+      try {
+        const mappingsResult = await getMigrationMappingsFn();
+        const mappings = mappingsResult.mappings || {};
+
+        // Find any mapping where the source issue starts with selectedExtProjectKey (e.g. "PROJ-")
+        const matchingSourceKey = Object.keys(mappings).find((key) =>
+          key.startsWith(`${selectedExtProjectKey}-`),
+        );
+
+        if (matchingSourceKey) {
+          const targetId = mappings[matchingSourceKey];
+          if (targetId && targetId.includes("-")) {
+            const targetProjectKey = targetId.split("-")[0];
+            const projectExists = intProjects.some((p) => p.key === targetProjectKey);
+            if (projectExists && targetProjectKey !== selectedIntProjectKey) {
+              setSelectedIntProjectKey(targetProjectKey);
+              toast.info(
+                `Automatically set target project to ${targetProjectKey} based on existing mappings.`,
+              );
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Failed to auto-select target project:", err);
+      }
+    };
+
+    autoSelectTargetProject();
+  }, [selectedExtProjectKey, isFullyConfigured, intProjects, selectedIntProjectKey]);
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return issues.filter((i) => {
-      if (q && !i.title.toLowerCase().includes(q) && !i.id.toLowerCase().includes(q))
-        return false;
+      if (q && !i.title.toLowerCase().includes(q) && !i.id.toLowerCase().includes(q)) return false;
       if (typeFilter !== "all" && i.type !== typeFilter) return false;
       return true;
     });
@@ -223,14 +261,16 @@ export function MigrationDashboard() {
           issueId,
           targetProjectKey: selectedIntProjectKey,
           targetIssueTypeName: mappedType,
-        }
+        },
       });
 
-      // Update local storage mappings
-      const localMappingStr = localStorage.getItem("jira_sync_migration_mapping");
-      const mappings = localMappingStr ? JSON.parse(localMappingStr) : {};
-      mappings[issueId] = internalId;
-      localStorage.setItem("jira_sync_migration_mapping", JSON.stringify(mappings));
+      // Update server mappings
+      await updateMigrationMappingFn({
+        data: {
+          issueId,
+          internalId,
+        },
+      });
 
       setIssues((prev) =>
         prev.map((i) =>
@@ -261,13 +301,13 @@ export function MigrationDashboard() {
 
     // Check if issue type exists in target project
     const typeExists = targetIssueTypes.some(
-      (t) => t.name.toLowerCase() === issue.type.toLowerCase()
+      (t) => t.name.toLowerCase() === issue.type.toLowerCase(),
     );
 
     if (typeExists) {
       // Migrate directly using the original issue type name
       const matchingType = targetIssueTypes.find(
-        (t) => t.name.toLowerCase() === issue.type.toLowerCase()
+        (t) => t.name.toLowerCase() === issue.type.toLowerCase(),
       )?.name;
       await executeMigration(issueId, matchingType);
     } else {
@@ -275,7 +315,7 @@ export function MigrationDashboard() {
       const savedMappingsStr = localStorage.getItem(`jira_type_mapping_${selectedIntProjectKey}`);
       const savedMappings = savedMappingsStr ? JSON.parse(savedMappingsStr) : {};
       const savedMappedType = savedMappings[issue.type];
-      
+
       const mappingValid =
         savedMappedType &&
         targetIssueTypes.some((t) => t.name.toLowerCase() === savedMappedType.toLowerCase());
@@ -283,16 +323,14 @@ export function MigrationDashboard() {
       if (mappingValid) {
         // Reuse mapping automatically
         const validTypeName = targetIssueTypes.find(
-          (t) => t.name.toLowerCase() === savedMappedType.toLowerCase()
+          (t) => t.name.toLowerCase() === savedMappedType.toLowerCase(),
         )?.name;
         await executeMigration(issueId, validTypeName);
       } else {
         // Prompt user to choose target mapping type
         setMappingIssue(issue);
         const defaultTargetType =
-          targetIssueTypes.find((t) => t.name === "Task")?.name ||
-          targetIssueTypes[0]?.name ||
-          "";
+          targetIssueTypes.find((t) => t.name === "Task")?.name || targetIssueTypes[0]?.name || "";
         setSelectedMappedType(defaultTargetType);
         setMappingDialogOpen(true);
       }
@@ -301,14 +339,14 @@ export function MigrationDashboard() {
 
   const handleConfirmMapping = async () => {
     if (!mappingIssue || !selectedMappedType) return;
-    
+
     // Save to localStorage under project-specific key
     const savedMappingsStr = localStorage.getItem(`jira_type_mapping_${selectedIntProjectKey}`);
     const savedMappings = savedMappingsStr ? JSON.parse(savedMappingsStr) : {};
     savedMappings[mappingIssue.type] = selectedMappedType;
     localStorage.setItem(
       `jira_type_mapping_${selectedIntProjectKey}`,
-      JSON.stringify(savedMappings)
+      JSON.stringify(savedMappings),
     );
 
     setMappingDialogOpen(false);
@@ -318,43 +356,50 @@ export function MigrationDashboard() {
     await executeMigration(targetIssueId, selectedMappedType);
   };
 
-  const handleUpdateMapping = (issueId: string, newInternalId: string | null) => {
-    // 1. Update localStorage
-    const localMappingStr = localStorage.getItem("jira_sync_migration_mapping");
-    const mappings = localMappingStr ? JSON.parse(localMappingStr) : {};
-    
-    if (newInternalId) {
-      mappings[issueId] = newInternalId.trim().toUpperCase();
-    } else {
-      delete mappings[issueId];
-    }
-    localStorage.setItem("jira_sync_migration_mapping", JSON.stringify(mappings));
+  const handleUpdateMapping = async (issueId: string, newInternalId: string | null) => {
+    try {
+      const cleanInternalId = newInternalId ? newInternalId.trim().toUpperCase() : null;
+      // 1. Update server mappings
+      await updateMigrationMappingFn({
+        data: {
+          issueId,
+          internalId: cleanInternalId,
+        },
+      });
 
-    // 2. Update state issues
-    setIssues((prev) =>
-      prev.map((i) => {
-        if (i.id === issueId) {
-          if (newInternalId) {
-            return {
-              ...i,
-              migrationStatus: "migrated" as const,
-              previouslyMigrated: true,
-              internalId: newInternalId.trim().toUpperCase(),
-            };
-          } else {
-            return {
-              ...i,
-              migrationStatus: "pending" as const,
-              previouslyMigrated: false,
-              internalId: undefined,
-            };
+      // 2. Update state issues
+      setIssues((prev) =>
+        prev.map((i) => {
+          if (i.id === issueId) {
+            if (cleanInternalId) {
+              return {
+                ...i,
+                migrationStatus: "migrated" as const,
+                previouslyMigrated: true,
+                internalId: cleanInternalId,
+              };
+            } else {
+              return {
+                ...i,
+                migrationStatus: "pending" as const,
+                previouslyMigrated: false,
+                internalId: undefined,
+              };
+            }
           }
-        }
-        return i;
-      })
-    );
+          return i;
+        }),
+      );
 
-    toast.success(newInternalId ? `Mapped ${issueId} to ${newInternalId.trim().toUpperCase()}` : `Removed mapping for ${issueId}`);
+      toast.success(
+        cleanInternalId
+          ? `Mapped ${issueId} to ${cleanInternalId}`
+          : `Removed mapping for ${issueId}`,
+      );
+    } catch (err: any) {
+      console.error(err);
+      toast.error(`Failed to update mapping on server: ${err.message}`);
+    }
   };
 
   const stats = useMemo(() => {
@@ -374,21 +419,26 @@ export function MigrationDashboard() {
                 <ArrowRightLeft className="h-3.5 w-3.5" />
                 External JIRA → Internal JIRA
               </div>
-              <h1 className="mt-1 text-xl font-semibold tracking-tight">
-                Migration Dashboard
-              </h1>
+              <h1 className="mt-1 text-xl font-semibold tracking-tight">Migration Dashboard</h1>
             </div>
             <div className="flex items-center gap-6">
               <div className="flex gap-6 text-right">
                 <Stat label="Total" value={stats.total} />
                 <Stat label="Migrated" value={stats.migrated} tone="success" />
                 <Stat label="Pending" value={stats.pending} tone="warning" />
-                {stats.failed > 0 && <Stat label="Failed" value={stats.failed} tone="destructive" />}
+                {stats.failed > 0 && (
+                  <Stat label="Failed" value={stats.failed} tone="destructive" />
+                )}
               </div>
               <div className="flex items-center gap-3 border-l pl-6">
                 <div className="flex flex-col items-end gap-0.5">
                   <div className="flex items-center gap-1.5 text-xs">
-                    <span className={cn("h-2 w-2 rounded-full", isFullyConfigured ? "bg-green-500 animate-pulse" : "bg-red-500")} />
+                    <span
+                      className={cn(
+                        "h-2 w-2 rounded-full",
+                        isFullyConfigured ? "bg-green-500 animate-pulse" : "bg-red-500",
+                      )}
+                    />
                     <span className="font-medium text-muted-foreground">
                       {isFullyConfigured ? "Connected" : "Not Configured"}
                     </span>
@@ -411,9 +461,22 @@ export function MigrationDashboard() {
             <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between rounded-lg border border-yellow-500/20 bg-yellow-500/5 px-4 py-3 text-sm text-yellow-600 dark:text-yellow-400">
               <div className="flex items-center gap-2">
                 <AlertTriangle className="h-4 w-4 text-yellow-500 shrink-0" />
-                <span>No JIRA connection configured. Please configure your JIRA credentials in Settings to query and sync real issues.</span>
+                <span>
+                  No JIRA connection configured. Please configure your JIRA credentials in Settings
+                  to query and sync real issues.
+                </span>
               </div>
-              <SettingsModal trigger={<Button variant="link" size="sm" className="h-auto p-0 font-semibold text-yellow-600 dark:text-yellow-400 hover:underline">Configure now →</Button>} />
+              <SettingsModal
+                trigger={
+                  <Button
+                    variant="link"
+                    size="sm"
+                    className="h-auto p-0 font-semibold text-yellow-600 dark:text-yellow-400 hover:underline"
+                  >
+                    Configure now →
+                  </Button>
+                }
+              />
             </div>
           )}
 
@@ -421,7 +484,9 @@ export function MigrationDashboard() {
           {isFullyConfigured && (
             <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center rounded-lg border bg-muted/20 p-3 text-sm">
               <div className="flex flex-1 flex-col gap-1.5 sm:flex-row sm:items-center">
-                <span className="font-semibold text-muted-foreground whitespace-nowrap">Source Project:</span>
+                <span className="font-semibold text-muted-foreground whitespace-nowrap">
+                  Source Project:
+                </span>
                 <Select value={selectedExtProjectKey} onValueChange={setSelectedExtProjectKey}>
                   <SelectTrigger className="w-full sm:w-64 bg-background">
                     <SelectValue placeholder="Select external project" />
@@ -437,7 +502,9 @@ export function MigrationDashboard() {
               </div>
 
               <div className="flex flex-1 flex-col gap-1.5 sm:flex-row sm:items-center sm:justify-end">
-                <span className="font-semibold text-muted-foreground whitespace-nowrap">Target Project:</span>
+                <span className="font-semibold text-muted-foreground whitespace-nowrap">
+                  Target Project:
+                </span>
                 <Select value={selectedIntProjectKey} onValueChange={setSelectedIntProjectKey}>
                   <SelectTrigger className="w-full sm:w-64 bg-background">
                     <SelectValue placeholder="Select target project" />
@@ -477,7 +544,7 @@ export function MigrationDashboard() {
                 <SelectItem value="Epic">Epic</SelectItem>
               </SelectContent>
             </Select>
-            
+
             <div className="relative w-full sm:w-56">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
               <Input
@@ -522,7 +589,9 @@ export function MigrationDashboard() {
             {!isFullyConfigured && (
               <div className="p-12 text-center text-sm text-muted-foreground flex flex-col items-center gap-2">
                 <AlertTriangle className="h-6 w-6 text-yellow-500" />
-                <span>No JIRA connection configured. Please configure settings to load issues.</span>
+                <span>
+                  No JIRA connection configured. Please configure settings to load issues.
+                </span>
               </div>
             )}
 
@@ -532,15 +601,16 @@ export function MigrationDashboard() {
               </div>
             )}
 
-            {!isLoading && filtered.map((issue) => (
-              <IssueRow
-                key={issue.id}
-                issue={issue}
-                onMigrate={handleMigration}
-                onUpdateMapping={handleUpdateMapping}
-                internalJiraUrl={config.internalJira?.url}
-              />
-            ))}
+            {!isLoading &&
+              filtered.map((issue) => (
+                <IssueRow
+                  key={issue.id}
+                  issue={issue}
+                  onMigrate={handleMigration}
+                  onUpdateMapping={handleUpdateMapping}
+                  internalJiraUrl={config.internalJira?.url}
+                />
+              ))}
           </div>
 
           <p className="mt-3 text-xs text-muted-foreground">
@@ -554,7 +624,9 @@ export function MigrationDashboard() {
           <DialogHeader>
             <DialogTitle>Map Issue Type</DialogTitle>
             <DialogDescription>
-              The issue type <strong>{mappingIssue?.type}</strong> does not exist in target project <strong>{selectedIntProjectKey}</strong>. Please map it to one of the available target issue types.
+              The issue type <strong>{mappingIssue?.type}</strong> does not exist in target project{" "}
+              <strong>{selectedIntProjectKey}</strong>. Please map it to one of the available target
+              issue types.
             </DialogDescription>
           </DialogHeader>
 
@@ -580,9 +652,7 @@ export function MigrationDashboard() {
             <Button variant="outline" onClick={() => setMappingDialogOpen(false)}>
               Cancel
             </Button>
-            <Button onClick={handleConfirmMapping}>
-              Confirm & Migrate
-            </Button>
+            <Button onClick={handleConfirmMapping}>Confirm & Migrate</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -612,9 +682,7 @@ function Stat({
       <div className={cn("text-lg font-semibold tabular-nums leading-none", toneClass)}>
         {value}
       </div>
-      <div className="mt-1 text-[11px] uppercase tracking-wider text-muted-foreground">
-        {label}
-      </div>
+      <div className="mt-1 text-[11px] uppercase tracking-wider text-muted-foreground">{label}</div>
     </div>
   );
 }
@@ -704,10 +772,20 @@ function IssueRow({
               }}
               autoFocus
             />
-            <Button size="icon" variant="ghost" className="h-7 w-7 text-green-600 hover:bg-green-50" onClick={handleSave}>
+            <Button
+              size="icon"
+              variant="ghost"
+              className="h-7 w-7 text-green-600 hover:bg-green-50"
+              onClick={handleSave}
+            >
               <Check className="h-3.5 w-3.5" />
             </Button>
-            <Button size="icon" variant="ghost" className="h-7 w-7 text-muted-foreground hover:bg-muted" onClick={handleCancel}>
+            <Button
+              size="icon"
+              variant="ghost"
+              className="h-7 w-7 text-muted-foreground hover:bg-muted"
+              onClick={handleCancel}
+            >
               <X className="h-3.5 w-3.5" />
             </Button>
           </div>
@@ -741,9 +819,10 @@ function MigrationButton({
   onDeleteMapping: () => void;
 }) {
   if (issue.migrationStatus === "migrated") {
-    const issueLink = internalJiraUrl && issue.internalId
-      ? `${internalJiraUrl.replace(/\/$/, "")}/browse/${issue.internalId}`
-      : null;
+    const issueLink =
+      internalJiraUrl && issue.internalId
+        ? `${internalJiraUrl.replace(/\/$/, "")}/browse/${issue.internalId}`
+        : null;
 
     return (
       <div className="flex items-center gap-1">
@@ -825,11 +904,7 @@ function MigrationButton({
 
   return (
     <div className="flex items-center gap-1.5">
-      <Button
-        size="sm"
-        onClick={() => onMigrate(issue.id)}
-        className="h-7 gap-1.5 text-xs"
-      >
+      <Button size="sm" onClick={() => onMigrate(issue.id)} className="h-7 gap-1.5 text-xs">
         <ArrowRightLeft className="h-3.5 w-3.5" />
         Migrate
       </Button>

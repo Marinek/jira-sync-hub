@@ -9,9 +9,11 @@ When migrating issues from the external JIRA instance to the internal JIRA insta
 ## Capabilities
 
 ### New Capabilities
+
 - None
 
 ### Modified Capabilities
+
 - `jira-sync`: Add requirement to include the external issue ID as a label on the target issue during migration.
 
 ## Impact

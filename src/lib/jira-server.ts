@@ -9,7 +9,7 @@ async function fetchJira(url: string, path: string, pat: string, options: Reques
   const method = options.method || "GET";
 
   console.log(`📡 [JIRA Outgoing] ${method} -> ${targetUrl}`);
-  
+
   const headers = new Headers(options.headers);
   headers.set("Authorization", `Bearer ${pat}`);
   headers.set("Accept", "application/json");
@@ -24,7 +24,9 @@ async function fetchJira(url: string, path: string, pat: string, options: Reques
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "Unknown error");
-    throw new Error(`JIRA API request failed: ${response.statusText} (${response.status}) - ${errorText}`);
+    throw new Error(
+      `JIRA API request failed: ${response.statusText} (${response.status}) - ${errorText}`,
+    );
   }
 
   return response.json();
@@ -40,29 +42,30 @@ export const searchJiraIssuesFn = createServerFn({ method: "POST" })
     z.object({
       config: jiraConfigSchema,
       jql: z.string(),
-    })
+    }),
   )
   .handler(async ({ data }) => {
     const { config, jql } = data;
-    
+
     // Default search parameters: get standard fields
     const fields = "summary,description,updated,assignee,issuetype,status";
     const path = `/rest/api/2/search?jql=${encodeURIComponent(jql)}&fields=${fields}&maxResults=100`;
-    
+
     try {
       const result = await fetchJira(config.url, path, config.pat);
-      
+
       const issues: JiraIssue[] = (result.issues || []).map((issue: any) => {
         const fields = issue.fields || {};
         const assigneeName = fields.assignee?.displayName || fields.assignee?.name || "Unassigned";
-        
+
         // Generate initials
-        const initials = assigneeName
-          .split(" ")
-          .map((n: string) => n[0])
-          .join("")
-          .toUpperCase()
-          .slice(0, 2) || "UA";
+        const initials =
+          assigneeName
+            .split(" ")
+            .map((n: string) => n[0])
+            .join("")
+            .toUpperCase()
+            .slice(0, 2) || "UA";
 
         return {
           id: issue.key,
@@ -89,7 +92,7 @@ export const getJiraProjectsFn = createServerFn({ method: "POST" })
   .validator(
     z.object({
       config: jiraConfigSchema,
-    })
+    }),
   )
   .handler(async ({ data }) => {
     const { config } = data;
@@ -112,7 +115,7 @@ export const getJiraProjectDetailsFn = createServerFn({ method: "POST" })
     z.object({
       config: jiraConfigSchema,
       projectKey: z.string(),
-    })
+    }),
   )
   .handler(async ({ data }) => {
     const { config, projectKey } = data;
@@ -139,7 +142,7 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
       issueId: z.string(),
       targetProjectKey: z.string(),
       targetIssueTypeName: z.string().optional(),
-    })
+    }),
   )
   .handler(async ({ data }) => {
     const { externalConfig, internalConfig, issueId, targetProjectKey, targetIssueTypeName } = data;
@@ -172,7 +175,7 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
         {
           method: "POST",
           body: JSON.stringify(createBody),
-        }
+        },
       );
 
       // 4. Copy attachments if present
@@ -182,7 +185,7 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
         for (const att of attachments) {
           try {
             console.log(`📎 Copying attachment: ${att.filename} (${att.size} bytes)`);
-            
+
             // Download from external
             const downloadRes = await fetch(att.content, {
               headers: {
@@ -199,7 +202,7 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
             uploadForm.append("file", blob, att.filename);
 
             const uploadUrl = `${internalConfig.url.replace(/\/$/, "")}/rest/api/2/issue/${createResult.key}/attachments`;
-            
+
             const uploadRes = await fetch(uploadUrl, {
               method: "POST",
               headers: {
@@ -226,6 +229,86 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
       };
     } catch (error: any) {
       console.error("Error in migrateJiraIssueFn:", error);
+      throw error;
+    }
+  });
+
+async function getMappingsFilePath() {
+  const path = await import("node:path");
+  return path.join(process.cwd(), "data", "mappings.json");
+}
+
+async function ensureMappingsFile() {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const filePath = await getMappingsFilePath();
+  try {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    try {
+      await fs.access(filePath);
+    } catch {
+      await fs.writeFile(filePath, JSON.stringify({}, null, 2), "utf-8");
+    }
+  } catch (error) {
+    console.error("Error ensuring mappings file:", error);
+  }
+}
+
+async function readMappings(): Promise<Record<string, string>> {
+  const fs = await import("node:fs/promises");
+  const filePath = await getMappingsFilePath();
+  await ensureMappingsFile();
+  try {
+    const data = await fs.readFile(filePath, "utf-8");
+    return JSON.parse(data);
+  } catch (error) {
+    console.error("Error reading mappings file:", error);
+    return {};
+  }
+}
+
+async function writeMappings(mappings: Record<string, string>): Promise<void> {
+  const fs = await import("node:fs/promises");
+  const filePath = await getMappingsFilePath();
+  await ensureMappingsFile();
+  try {
+    await fs.writeFile(filePath, JSON.stringify(mappings, null, 2), "utf-8");
+  } catch (error) {
+    console.error("Error writing mappings file:", error);
+    throw error;
+  }
+}
+
+export const getMigrationMappingsFn = createServerFn({ method: "GET" }).handler(async () => {
+  try {
+    const mappings = await readMappings();
+    return { mappings };
+  } catch (error: any) {
+    console.error("Error in getMigrationMappingsFn:", error);
+    throw error;
+  }
+});
+
+export const updateMigrationMappingFn = createServerFn({ method: "POST" })
+  .validator(
+    z.object({
+      issueId: z.string(),
+      internalId: z.string().nullable(),
+    }),
+  )
+  .handler(async ({ data }) => {
+    const { issueId, internalId } = data;
+    try {
+      const mappings = await readMappings();
+      if (internalId) {
+        mappings[issueId] = internalId;
+      } else {
+        delete mappings[issueId];
+      }
+      await writeMappings(mappings);
+      return { success: true };
+    } catch (error: any) {
+      console.error("Error in updateMigrationMappingFn:", error);
       throw error;
     }
   });

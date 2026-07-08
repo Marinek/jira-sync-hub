@@ -11,9 +11,11 @@ Additionally, issues often contain attachments (images, PDFs, documents) which a
 ## Capabilities
 
 ### New Capabilities
+
 - None
 
 ### Modified Capabilities
+
 - `jira-sync`: Add requirement for target issue type mapping fallback and attachment transfer during migration.
 
 ## Impact
