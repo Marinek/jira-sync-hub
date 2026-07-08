@@ -312,3 +312,54 @@ export const updateMigrationMappingFn = createServerFn({ method: "POST" })
       throw error;
     }
   });
+
+export const getJiraIssueDetailsFn = createServerFn({ method: "POST" })
+  .validator(
+    z.object({
+      config: jiraConfigSchema,
+      issueId: z.string(),
+    }),
+  )
+  .handler(async ({ data }) => {
+    const { config, issueId } = data;
+    try {
+      if (!config.url || !config.pat) {
+        const { getMockIssueDetails } = await import("./jira-mock");
+        return getMockIssueDetails(issueId);
+      }
+      const result = await fetchJira(
+        config.url,
+        `/rest/api/2/issue/${issueId}?fields=description,comment`,
+        config.pat,
+      );
+      const fields = result.fields || {};
+      const description = fields.description || "";
+      const commentsList = fields.comment?.comments || [];
+
+      const comments = commentsList.map((c: any) => {
+        const authorName = c.author?.displayName || c.author?.name || "Unknown Author";
+        const initials =
+          authorName
+            .split(" ")
+            .map((n: string) => n[0])
+            .join("")
+            .toUpperCase()
+            .slice(0, 2) || "UA";
+
+        return {
+          id: c.id,
+          author: {
+            name: authorName,
+            initials,
+          },
+          body: c.body || "",
+          createdAt: c.created || new Date().toISOString(),
+        };
+      });
+
+      return { description, comments };
+    } catch (error: any) {
+      console.error("Error in getJiraIssueDetailsFn:", error);
+      throw error;
+    }
+  });

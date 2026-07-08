@@ -16,6 +16,7 @@ import {
   X,
   Check,
   RefreshCw,
+  Eye,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -47,6 +48,7 @@ import {
   getJiraProjectDetailsFn,
   getMigrationMappingsFn,
   updateMigrationMappingFn,
+  getJiraIssueDetailsFn,
 } from "@/lib/jira-server";
 import { cn } from "@/lib/utils";
 import { SettingsModal } from "@/components/SettingsModal";
@@ -85,6 +87,40 @@ export function MigrationDashboard() {
   const [mappingDialogOpen, setMappingDialogOpen] = useState(false);
   const [mappingIssue, setMappingIssue] = useState<JiraIssue | null>(null);
   const [selectedMappedType, setSelectedMappedType] = useState<string>("");
+
+  // Issue details dialog state
+  const [detailsIssueId, setDetailsIssueId] = useState<string | null>(null);
+  const [detailsIssueTitle, setDetailsIssueTitle] = useState<string>("");
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  const [detailsDescription, setDetailsDescription] = useState("");
+  const [detailsComments, setDetailsComments] = useState<any[]>([]);
+  const [detailsDialogOpen, setDetailsDialogOpen] = useState(false);
+
+  const handleOpenDetails = async (issueId: string, issueTitle: string) => {
+    setDetailsIssueId(issueId);
+    setDetailsIssueTitle(issueTitle);
+    setDetailsLoading(true);
+    setDetailsDescription("");
+    setDetailsComments([]);
+    setDetailsDialogOpen(true);
+
+    try {
+      const res = await getJiraIssueDetailsFn({
+        data: {
+          config: config.externalJira,
+          issueId,
+        },
+      });
+      setDetailsDescription(res.description || "No description provided.");
+      setDetailsComments(res.comments || []);
+    } catch (err: any) {
+      console.error(err);
+      toast.error("Failed to load issue details: " + err.message);
+      setDetailsDescription("Error loading description.");
+    } finally {
+      setDetailsLoading(false);
+    }
+  };
 
   // Fetch target project details (issue types) when target project changes
   useEffect(() => {
@@ -608,6 +644,7 @@ export function MigrationDashboard() {
                   issue={issue}
                   onMigrate={handleMigration}
                   onUpdateMapping={handleUpdateMapping}
+                  onViewDetails={handleOpenDetails}
                   internalJiraUrl={config.internalJira?.url}
                 />
               ))}
@@ -656,6 +693,75 @@ export function MigrationDashboard() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog open={detailsDialogOpen} onOpenChange={setDetailsDialogOpen}>
+        <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <span className="rounded border bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
+                {detailsIssueId}
+              </span>
+              <span>{detailsIssueTitle}</span>
+            </DialogTitle>
+          </DialogHeader>
+
+          {detailsLoading ? (
+            <div className="py-20 flex flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-6 w-6 animate-spin text-primary" />
+              <span>Loading details and comments...</span>
+            </div>
+          ) : (
+            <div className="space-y-6 py-4">
+              {/* Description Section */}
+              <div className="space-y-2">
+                <h3 className="text-sm font-semibold text-foreground uppercase tracking-wider">
+                  Description
+                </h3>
+                <div className="rounded-lg border bg-muted/20 p-4 text-sm text-foreground whitespace-pre-wrap leading-relaxed">
+                  {detailsDescription}
+                </div>
+              </div>
+
+              {/* Comments Section */}
+              <div className="space-y-4">
+                <h3 className="text-sm font-semibold text-foreground uppercase tracking-wider">
+                  Comments ({detailsComments.length})
+                </h3>
+                {detailsComments.length === 0 ? (
+                  <p className="text-xs text-muted-foreground italic">No comments on this issue.</p>
+                ) : (
+                  <div className="space-y-3">
+                    {detailsComments.map((comment) => (
+                      <div key={comment.id} className="rounded-lg border p-3.5 space-y-2 bg-card">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <div className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/10 text-[9px] font-semibold text-primary">
+                              {comment.author.initials}
+                            </div>
+                            <span className="text-xs font-semibold text-foreground">
+                              {comment.author.name}
+                            </span>
+                          </div>
+                          <span className="text-[10px] text-muted-foreground tabular-nums">
+                            {formatRelative(comment.createdAt)}
+                          </span>
+                        </div>
+                        <p className="text-xs text-muted-foreground whitespace-pre-wrap leading-relaxed">
+                          {comment.body}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          <DialogFooter>
+            <Button onClick={() => setDetailsDialogOpen(false)}>Close</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </TooltipProvider>
   );
 }
@@ -691,11 +797,13 @@ function IssueRow({
   issue,
   onMigrate,
   onUpdateMapping,
+  onViewDetails,
   internalJiraUrl,
 }: {
   issue: JiraIssue;
   onMigrate: (id: string) => void;
   onUpdateMapping: (issueId: string, newInternalId: string | null) => void;
+  onViewDetails: (issueId: string, issueTitle: string) => void;
   internalJiraUrl?: string;
 }) {
   const meta = typeMeta[issue.type] || typeMeta["Task"];
@@ -731,7 +839,13 @@ function IssueRow({
       </div>
 
       <div className="flex min-w-0 items-center gap-2">
-        <span className="truncate font-medium text-foreground">{issue.title}</span>
+        <button
+          onClick={() => onViewDetails(issue.id, issue.title)}
+          className="truncate font-medium text-foreground hover:text-primary hover:underline text-left focus:outline-none"
+          title="Click to view details and comments"
+        >
+          {issue.title}
+        </button>
         {issue.previouslyMigrated && issue.migrationStatus !== "migrated" && (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -758,7 +872,16 @@ function IssueRow({
         {formatRelative(issue.updatedAt)}
       </div>
 
-      <div className="flex justify-end">
+      <div className="flex justify-end gap-1.5 items-center">
+        <Button
+          size="icon"
+          variant="ghost"
+          className="h-7 w-7 text-muted-foreground hover:text-foreground opacity-0 group-hover:opacity-100 transition-opacity"
+          onClick={() => onViewDetails(issue.id, issue.title)}
+          title="View Issue Details"
+        >
+          <Eye className="h-3.5 w-3.5" />
+        </Button>
         {isEditing ? (
           <div className="flex items-center gap-1">
             <Input

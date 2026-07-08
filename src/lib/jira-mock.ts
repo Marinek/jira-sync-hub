@@ -139,3 +139,38 @@ export function formatRelative(iso: string): string {
   if (d < 7) return `${d}d ago`;
   return `${Math.floor(d / 7)}w ago`;
 }
+
+export interface MockComment {
+  id: string;
+  author: { name: string; initials: string };
+  body: string;
+  createdAt: string;
+}
+
+export interface MockIssueDetails {
+  description: string;
+  comments: MockComment[];
+}
+
+export function getMockIssueDetails(issueId: string): MockIssueDetails {
+  const issue = mockIssues.find((i) => i.id === issueId);
+  const title = issue ? issue.title : "Sample Issue";
+
+  return {
+    description: `This is the detailed description for JIRA issue **${issueId}** (${title}).\n\n### Business Context\nWe need to ensure that this requirement is met for our Q3 milestones. Please check all dependencies before migrating.\n\n* No attachments should be copied for this step.`,
+    comments: [
+      {
+        id: "c1",
+        author: { name: "Marcus Chen", initials: "MC" },
+        body: "I have investigated this issue. It seems straightforward to migrate, but we should make sure the issue types map correctly.",
+        createdAt: hoursAgo(4),
+      },
+      {
+        id: "c2",
+        author: { name: "Priya Shah", initials: "PS" },
+        body: "Agreed. I'll test the promo code validation locally to confirm the fix before we sync.",
+        createdAt: hoursAgo(2),
+      },
+    ],
+  };
+}
