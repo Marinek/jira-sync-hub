@@ -3,9 +3,7 @@
 ## Purpose
 
 TBD - created by archiving change jira-external-search-and-sync. Update Purpose after archive.
-
 ## Requirements
-
 ### Requirement: Jira Configuration Management
 
 The system SHALL allow the user to save and retrieve connection credentials (URL, Personal Access Token (PAT)) for both the external and internal Jira instances in `localStorage`.
@@ -22,12 +20,12 @@ The system SHALL allow the user to save and retrieve connection credentials (URL
 
 ### Requirement: External Issue Querying
 
-The system SHALL query the external Jira instance for issues using a JQL query based on the configurable selection criteria (such as assignee and status category exclusions) entered by the user in the UI.
+The system SHALL query the external Jira instance for issues using a JQL query based on the configurable selection criteria (such as assignee, status category exclusions, issue type, and search text queries) entered by the user in the UI, only when the user explicitly triggers the search.
 
-#### Scenario: Search issues with custom assignee and status criteria
+#### Scenario: Search issues with custom assignee, status, issue type, and search text or ID criteria
 
-- **WHEN** the user selects or enters a target assignee (e.g. "Person X") and specifies status exclusions in the search filters
-- **THEN** the system SHALL construct the corresponding JQL query (e.g. `assignee = "Person X" AND statusCategory != Done`) and call the external Jira search API to fetch and display matching issues
+- **WHEN** the user selects or enters a target assignee (e.g., "Person X"), specifies status exclusions, selects an issue type (e.g., "Bug"), and/or enters a search query (e.g., "PROJ-123" or "login") in the search filters, and clicks the "Search" button or presses Enter
+- **THEN** the system SHALL construct the corresponding JQL query (e.g., `assignee = "Person X" AND statusCategory != Done AND issuetype = "Bug" AND (summary ~ "login" OR description ~ "login" OR key = "login")` or `issuetype = "Bug" AND (summary ~ "PROJ-123" OR description ~ "PROJ-123" OR key = "PROJ-123")`) using exact match for the issue key (`key = ...`), exact match for issue type (`issuetype = ...`), and text contains search for summary/description (`summary ~ ...`), and call the external Jira search API to fetch and display matching issues
 
 ### Requirement: Issue Migration Execution
 
@@ -60,3 +58,4 @@ The system SHALL automatically pre-select the target internal project in the sel
 
 - **WHEN** the user selects a source external project
 - **THEN** the system SHALL check if any existing mappings link issues from this external project to an internal project, and if so, automatically select that internal project as the target project in the UI
+

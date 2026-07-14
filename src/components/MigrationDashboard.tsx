@@ -72,6 +72,7 @@ export function MigrationDashboard() {
   const [assigneeFilter, setAssigneeFilter] = useState<string>("");
   const [isLoading, setIsLoading] = useState(false);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
+  const [searchTrigger, setSearchTrigger] = useState(0);
 
   // Projects list state
   const [extProjects, setExtProjects] = useState<JiraProject[]>([]);
@@ -184,7 +185,7 @@ export function MigrationDashboard() {
     fetchProjects();
   }, [isFullyConfigured, config]);
 
-  // Load issues from selected JIRA project
+  // Fetch live issues when configuration, active project, or search trigger changes
   useEffect(() => {
     if (!isFullyConfigured || !selectedExtProjectKey) {
       setIssues([]);
@@ -197,9 +198,18 @@ export function MigrationDashboard() {
         // Construct JQL dynamically with selected project key
         let jql = `project = "${selectedExtProjectKey}" AND statusCategory != Done`;
 
+        if (typeFilter !== "all") {
+          jql += ` AND issuetype = "${typeFilter}"`;
+        }
+
         if (assigneeFilter.trim() !== "") {
           const cleanAssignee = assigneeFilter.trim();
           jql += ` AND assignee = "${cleanAssignee}"`;
+        }
+
+        if (query.trim() !== "") {
+          const cleanQuery = query.trim().replace(/"/g, '\\"');
+          jql += ` AND (summary ~ "${cleanQuery}" OR description ~ "${cleanQuery}" OR key = "${cleanQuery}")`;
         }
 
         const result = await searchJiraIssuesFn({
@@ -234,9 +244,8 @@ export function MigrationDashboard() {
       }
     };
 
-    const timer = setTimeout(fetchLiveIssues, 500);
-    return () => clearTimeout(timer);
-  }, [isFullyConfigured, config, assigneeFilter, selectedExtProjectKey, refreshTrigger]);
+    fetchLiveIssues();
+  }, [isFullyConfigured, config, selectedExtProjectKey, searchTrigger, refreshTrigger]);
 
   // Automatic target project selection when source project changes
   useEffect(() => {
@@ -275,14 +284,19 @@ export function MigrationDashboard() {
     autoSelectTargetProject();
   }, [selectedExtProjectKey, isFullyConfigured, intProjects, selectedIntProjectKey]);
 
+  const triggerSearch = () => {
+    setSearchTrigger((prev) => prev + 1);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      triggerSearch();
+    }
+  };
+
   const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return issues.filter((i) => {
-      if (q && !i.title.toLowerCase().includes(q) && !i.id.toLowerCase().includes(q)) return false;
-      if (typeFilter !== "all" && i.type !== typeFilter) return false;
-      return true;
-    });
-  }, [issues, query, typeFilter]);
+    return issues;
+  }, [issues]);
 
   const executeMigration = async (issueId: string, mappedType?: string) => {
     setIssues((prev) =>
@@ -564,6 +578,7 @@ export function MigrationDashboard() {
               <Input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={handleKeyDown}
                 placeholder="Search by title or issue ID…"
                 className="pl-9"
               />
@@ -586,21 +601,32 @@ export function MigrationDashboard() {
               <Input
                 value={assigneeFilter}
                 onChange={(e) => setAssigneeFilter(e.target.value)}
+                onKeyDown={handleKeyDown}
                 placeholder="Assignee name (e.g. Marcus Chen)..."
                 className="pl-9"
               />
             </div>
 
             {isFullyConfigured && (
-              <Button
-                variant="outline"
-                size="icon"
-                onClick={() => setRefreshTrigger((prev) => prev + 1)}
-                disabled={isLoading}
-                title="Refresh issues"
-              >
-                <RefreshCw className={cn("h-4 w-4", isLoading && "animate-spin")} />
-              </Button>
+              <div className="flex gap-2 w-full sm:w-auto">
+                <Button
+                  onClick={triggerSearch}
+                  disabled={isLoading}
+                  className="flex-1 sm:flex-initial"
+                >
+                  <Search className="mr-2 h-4 w-4" />
+                  Search
+                </Button>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  onClick={() => setRefreshTrigger((prev) => prev + 1)}
+                  disabled={isLoading}
+                  title="Refresh issues"
+                >
+                  <RefreshCw className={cn("h-4 w-4", isLoading && "animate-spin")} />
+                </Button>
+              </div>
             )}
           </div>
 
