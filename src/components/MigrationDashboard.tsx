@@ -44,6 +44,7 @@ import { type IssueType, type JiraIssue, type JiraProject } from "@/lib/jira-typ
 import {
   searchJiraIssuesFn,
   migrateJiraIssueFn,
+  updateMappedJiraIssueFn,
   getJiraProjectsFn,
   getJiraProjectDetailsFn,
   getMigrationMappingsFn,
@@ -96,6 +97,20 @@ export function MigrationDashboard() {
   const [detailsDescription, setDetailsDescription] = useState("");
   const [detailsComments, setDetailsComments] = useState<any[]>([]);
   const [detailsDialogOpen, setDetailsDialogOpen] = useState(false);
+
+  const [syncStateByIssueId, setSyncStateByIssueId] = useState<
+    Record<
+      string,
+      {
+        isLoading: boolean;
+        lastStatus?: "success" | "partial" | "failure";
+        message?: string;
+        hasRetryableErrors?: boolean;
+        failedCount?: number;
+        failedAttachments?: string[];
+      }
+    >
+  >({});
 
   const handleOpenDetails = async (issueId: string, issueTitle: string) => {
     setDetailsIssueId(issueId);
@@ -452,6 +467,85 @@ export function MigrationDashboard() {
     }
   };
 
+  const handleSyncMappedIssue = async (issueId: string) => {
+    const issue = issues.find((i) => i.id === issueId);
+    if (!issue?.internalId) {
+      toast.error(`No mapped target issue exists for ${issueId}.`);
+      return;
+    }
+
+    setSyncStateByIssueId((prev) => ({
+      ...prev,
+      [issueId]: {
+        ...(prev[issueId] || {}),
+        isLoading: true,
+      },
+    }));
+
+    try {
+      const result = await updateMappedJiraIssueFn({
+        data: {
+          externalConfig: config.externalJira,
+          internalConfig: config.internalJira,
+          issueId,
+          internalId: issue.internalId,
+        },
+      });
+
+      const summary = result.attachmentSummary;
+      const failedList = result.attachments.filter((a: any) => a.action === "failed");
+      const failedAttachments = failedList.map((a: any) => a.filename).slice(0, 3);
+      const hasRetryableErrors =
+        failedList.some((a: any) => a.retryable) || result.errors.some((e: any) => e.retryable);
+
+      const message =
+        result.status === "success"
+          ? `Updated ${issueId} (${summary.uploadedCount} uploaded, ${summary.skippedCount} already present)`
+          : result.status === "partial"
+            ? `Partially updated ${issueId} (${summary.uploadedCount} uploaded, ${summary.failedCount} failed)`
+            : `Failed to update ${issueId}`;
+
+      setSyncStateByIssueId((prev) => ({
+        ...prev,
+        [issueId]: {
+          isLoading: false,
+          lastStatus: result.status,
+          message,
+          hasRetryableErrors,
+          failedCount: summary.failedCount,
+          failedAttachments,
+        },
+      }));
+
+      if (result.status === "success") {
+        toast.success(message);
+      } else if (result.status === "partial") {
+        toast.warning(message);
+      } else {
+        const firstError = result.errors[0]?.message;
+        toast.error(firstError ? `${message}: ${firstError}` : message);
+      }
+
+      setIssues((prev) =>
+        prev.map((i) =>
+          i.id === issueId ? { ...i, migrationStatus: "migrated", updatedAt: new Date().toISOString() } : i,
+        ),
+      );
+    } catch (err: any) {
+      const message = `Failed to update ${issueId}: ${err.message}`;
+      setSyncStateByIssueId((prev) => ({
+        ...prev,
+        [issueId]: {
+          isLoading: false,
+          lastStatus: "failure",
+          message,
+          hasRetryableErrors: true,
+        },
+      }));
+      toast.error(message);
+    }
+  };
+
   const stats = useMemo(() => {
     const migrated = issues.filter((i) => i.migrationStatus === "migrated").length;
     const pending = issues.filter((i) => i.migrationStatus === "pending").length;
@@ -669,9 +763,11 @@ export function MigrationDashboard() {
                   key={issue.id}
                   issue={issue}
                   onMigrate={handleMigration}
+                  onSyncMappedIssue={handleSyncMappedIssue}
                   onUpdateMapping={handleUpdateMapping}
                   onViewDetails={handleOpenDetails}
                   internalJiraUrl={config.internalJira?.url}
+                  syncState={syncStateByIssueId[issue.id]}
                 />
               ))}
           </div>
@@ -822,15 +918,26 @@ function Stat({
 function IssueRow({
   issue,
   onMigrate,
+  onSyncMappedIssue,
   onUpdateMapping,
   onViewDetails,
   internalJiraUrl,
+  syncState,
 }: {
   issue: JiraIssue;
   onMigrate: (id: string) => void;
+  onSyncMappedIssue: (id: string) => void;
   onUpdateMapping: (issueId: string, newInternalId: string | null) => void;
   onViewDetails: (issueId: string, issueTitle: string) => void;
   internalJiraUrl?: string;
+  syncState?: {
+    isLoading: boolean;
+    lastStatus?: "success" | "partial" | "failure";
+    message?: string;
+    hasRetryableErrors?: boolean;
+    failedCount?: number;
+    failedAttachments?: string[];
+  };
 }) {
   const meta = typeMeta[issue.type] || typeMeta["Task"];
   const Icon = meta.icon;
@@ -943,9 +1050,11 @@ function IssueRow({
             <MigrationButton
               issue={issue}
               onMigrate={onMigrate}
+              onSyncMappedIssue={onSyncMappedIssue}
               internalJiraUrl={internalJiraUrl}
               onStartEdit={() => setIsEditing(true)}
               onDeleteMapping={() => onUpdateMapping(issue.id, null)}
+              syncState={syncState}
             />
           </div>
         )}
@@ -957,16 +1066,36 @@ function IssueRow({
 function MigrationButton({
   issue,
   onMigrate,
+  onSyncMappedIssue,
   internalJiraUrl,
   onStartEdit,
   onDeleteMapping,
+  syncState,
 }: {
   issue: JiraIssue;
   onMigrate: (id: string) => void;
+  onSyncMappedIssue: (id: string) => void;
   internalJiraUrl?: string;
   onStartEdit: () => void;
   onDeleteMapping: () => void;
+  syncState?: {
+    isLoading: boolean;
+    lastStatus?: "success" | "partial" | "failure";
+    message?: string;
+    hasRetryableErrors?: boolean;
+    failedCount?: number;
+    failedAttachments?: string[];
+  };
 }) {
+  const lastSyncTone =
+    syncState?.lastStatus === "success"
+      ? "border-green-500/30 bg-green-500/10 text-green-600"
+      : syncState?.lastStatus === "partial"
+        ? "border-amber-500/30 bg-amber-500/10 text-amber-600"
+        : syncState?.lastStatus === "failure"
+          ? "border-destructive/30 bg-destructive/10 text-destructive"
+          : "";
+
   if (issue.migrationStatus === "migrated") {
     const issueLink =
       internalJiraUrl && issue.internalId
@@ -993,6 +1122,36 @@ function MigrationButton({
             <span>Migrated{issue.internalId ? ` · ${issue.internalId}` : ""}</span>
           )}
         </Badge>
+        <Button
+          size="sm"
+          variant={syncState?.lastStatus === "failure" ? "outline" : "ghost"}
+          className="h-7 gap-1.5 text-xs"
+          onClick={() => onSyncMappedIssue(issue.id)}
+          disabled={syncState?.isLoading}
+          title={syncState?.message || "Update mapped target issue"}
+        >
+          <RefreshCw className={cn("h-3.5 w-3.5", syncState?.isLoading && "animate-spin")} />
+          {syncState?.isLoading
+            ? "Updating..."
+            : syncState?.lastStatus === "failure" && syncState?.hasRetryableErrors
+              ? "Retry Update"
+              : "Update"}
+        </Button>
+        {syncState?.lastStatus && (
+          <Badge
+            variant="outline"
+            className={cn("h-7 px-2 text-[10px]", lastSyncTone)}
+            title={
+              syncState.lastStatus === "partial" && syncState.failedAttachments?.length
+                ? `Failed attachments: ${syncState.failedAttachments.join(", ")}${syncState.failedCount && syncState.failedCount > syncState.failedAttachments.length ? "..." : ""}`
+                : syncState.message
+            }
+          >
+            {syncState.lastStatus === "partial" && syncState.failedCount
+              ? `partial (${syncState.failedCount} failed)`
+              : syncState.lastStatus}
+          </Badge>
+        )}
         <div className="flex opacity-0 group-hover:opacity-100 transition-opacity gap-0.5">
           <Button
             size="icon"

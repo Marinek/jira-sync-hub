@@ -2,6 +2,141 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { type JiraConfig, type JiraIssue } from "./jira-types";
 
+type SyncErrorType = "permission" | "rate_limit" | "timeout" | "network" | "unknown";
+
+type SyncAttachmentResult = {
+  filename: string;
+  size: number;
+  action: "uploaded" | "skipped" | "failed";
+  retryable: boolean;
+  errorType?: SyncErrorType;
+  error?: string;
+};
+
+type SyncStepError = {
+  step: "fetch_source" | "fetch_target" | "update_fields" | "transfer_attachments";
+  type: SyncErrorType;
+  message: string;
+  retryable: boolean;
+  statusCode?: number;
+};
+
+class JiraHttpError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly statusText: string,
+    public readonly responseBody: string,
+  ) {
+    super(message);
+    this.name = "JiraHttpError";
+  }
+}
+
+function classifySyncError(error: unknown): {
+  type: SyncErrorType;
+  retryable: boolean;
+  message: string;
+  statusCode?: number;
+} {
+  if (error instanceof JiraHttpError) {
+    if (error.status === 401 || error.status === 403) {
+      return {
+        type: "permission",
+        retryable: false,
+        message: error.message,
+        statusCode: error.status,
+      };
+    }
+    if (error.status === 429) {
+      return {
+        type: "rate_limit",
+        retryable: true,
+        message: error.message,
+        statusCode: error.status,
+      };
+    }
+    return {
+      type: "unknown",
+      retryable: error.status >= 500,
+      message: error.message,
+      statusCode: error.status,
+    };
+  }
+
+  const maybeError = error as { name?: string; message?: string };
+  if (maybeError?.name === "TimeoutError" || maybeError?.name === "AbortError") {
+    return {
+      type: "timeout",
+      retryable: true,
+      message: maybeError.message || "Request timed out",
+    };
+  }
+
+  if (maybeError?.name === "TypeError") {
+    return {
+      type: "network",
+      retryable: true,
+      message: maybeError.message || "Network error",
+    };
+  }
+
+  return {
+    type: "unknown",
+    retryable: false,
+    message: maybeError?.message || "Unknown error",
+  };
+}
+
+function addSyncError(
+  list: SyncStepError[],
+  step: SyncStepError["step"],
+  error: unknown,
+  fallbackMessage: string,
+) {
+  const classified = classifySyncError(error);
+  list.push({
+    step,
+    type: classified.type,
+    retryable: classified.retryable,
+    statusCode: classified.statusCode,
+    message: classified.message || fallbackMessage,
+  });
+}
+
+function attachmentFingerprint(att: { filename?: string; size?: number }) {
+  return `${att.filename || "unknown"}::${att.size || 0}`;
+}
+
+function splitMigrationDescription(description: string) {
+  const trimmed = description.trim();
+  const separatorIndex = trimmed.indexOf("\n\n");
+  if (separatorIndex === -1) {
+    return { prefix: trimmed, body: "" };
+  }
+
+  return {
+    prefix: trimmed.slice(0, separatorIndex),
+    body: trimmed.slice(separatorIndex + 2).trim(),
+  };
+}
+
+function buildUpdatedDescription(existingDescription: string | undefined, sourceDescription: string) {
+  const sourceBody = sourceDescription.trim();
+  const existing = existingDescription?.trim();
+
+  if (!existing) {
+    return sourceBody;
+  }
+
+  const { prefix } = splitMigrationDescription(existing);
+  if (/^(Ursprünglich:|Migrated from)/.test(prefix)) {
+    return `${prefix}\n\n${sourceBody}`;
+  }
+
+  return `${existing}\n\n${sourceBody}`;
+}
+
 // Helper to make requests to JIRA API
 async function fetchJira(url: string, path: string, pat: string, options: RequestInit = {}) {
   const cleanUrl = url.replace(/\/$/, "");
@@ -24,12 +159,81 @@ async function fetchJira(url: string, path: string, pat: string, options: Reques
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "Unknown error");
-    throw new Error(
+    throw new JiraHttpError(
       `JIRA API request failed: ${response.statusText} (${response.status}) - ${errorText}`,
+      response.status,
+      response.statusText,
+      errorText,
     );
   }
 
-  return response.json();
+  if (response.status === 204) {
+    return null;
+  }
+
+  const body = await response.text();
+  if (!body.trim()) {
+    return null;
+  }
+
+  return JSON.parse(body);
+}
+
+async function downloadAttachment(
+  contentUrl: string,
+  externalPat: string,
+  filename: string,
+): Promise<Blob> {
+  const response = await fetch(contentUrl, {
+    headers: {
+      Authorization: `Bearer ${externalPat}`,
+    },
+    signal: AbortSignal.timeout(45000),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new JiraHttpError(
+      `Failed to download attachment ${filename}: ${response.statusText} (${response.status}) - ${body}`,
+      response.status,
+      response.statusText,
+      body,
+    );
+  }
+
+  return response.blob();
+}
+
+async function uploadAttachment(
+  internalUrl: string,
+  internalPat: string,
+  targetIssueId: string,
+  filename: string,
+  payload: Blob,
+): Promise<void> {
+  const uploadUrl = `${internalUrl.replace(/\/$/, "")}/rest/api/2/issue/${targetIssueId}/attachments`;
+  const form = new FormData();
+  form.append("file", payload, filename);
+
+  const response = await fetch(uploadUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${internalPat}`,
+      "X-Atlassian-Token": "no-check",
+    },
+    body: form,
+    signal: AbortSignal.timeout(45000),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new JiraHttpError(
+      `Failed to upload attachment ${filename}: ${response.statusText} (${response.status}) - ${body}`,
+      response.status,
+      response.statusText,
+      body,
+    );
+  }
 }
 
 const jiraConfigSchema = z.object({
@@ -361,5 +565,201 @@ export const getJiraIssueDetailsFn = createServerFn({ method: "POST" })
     } catch (error: any) {
       console.error("Error in getJiraIssueDetailsFn:", error);
       throw error;
+    }
+  });
+
+export const updateMappedJiraIssueFn = createServerFn({ method: "POST" })
+  .validator(
+    z.object({
+      externalConfig: jiraConfigSchema,
+      internalConfig: jiraConfigSchema,
+      issueId: z.string(),
+      internalId: z.string(),
+    }),
+  )
+  .handler(async ({ data }) => {
+    const { externalConfig, internalConfig, issueId, internalId } = data;
+    const errors: SyncStepError[] = [];
+    const attachmentResults: SyncAttachmentResult[] = [];
+
+    let sourceAttachmentsCount = 0;
+    let targetAttachmentsCount = 0;
+    let fieldsUpdated = false;
+
+    try {
+      const sourceIssuePath = `/rest/api/2/issue/${issueId}?fields=summary,description,attachment`;
+      const targetIssuePath = `/rest/api/2/issue/${internalId}?fields=description,attachment`;
+
+      let sourceIssue: any;
+      try {
+        sourceIssue = await fetchJira(externalConfig.url, sourceIssuePath, externalConfig.pat);
+      } catch (error) {
+        addSyncError(errors, "fetch_source", error, "Failed to fetch source issue");
+        return {
+          issueId,
+          internalId,
+          status: "failure" as const,
+          fieldsUpdated,
+          attachments: attachmentResults,
+          attachmentSummary: {
+            sourceCount: sourceAttachmentsCount,
+            targetCount: targetAttachmentsCount,
+            uploadedCount: 0,
+            skippedCount: 0,
+            failedCount: 0,
+          },
+          errors,
+        };
+      }
+
+      let targetIssue: any;
+      try {
+        targetIssue = await fetchJira(internalConfig.url, targetIssuePath, internalConfig.pat);
+      } catch (error) {
+        addSyncError(errors, "fetch_target", error, "Failed to fetch target issue");
+        return {
+          issueId,
+          internalId,
+          status: "failure" as const,
+          fieldsUpdated,
+          attachments: attachmentResults,
+          attachmentSummary: {
+            sourceCount: sourceAttachmentsCount,
+            targetCount: targetAttachmentsCount,
+            uploadedCount: 0,
+            skippedCount: 0,
+            failedCount: 0,
+          },
+          errors,
+        };
+      }
+
+      try {
+        await fetchJira(internalConfig.url, `/rest/api/2/issue/${internalId}`, internalConfig.pat, {
+          method: "PUT",
+          body: JSON.stringify({
+            fields: {
+              summary: sourceIssue.fields?.summary || "",
+              description: buildUpdatedDescription(
+                targetIssue.fields?.description,
+                sourceIssue.fields?.description || "",
+              ),
+            },
+          }),
+        });
+        fieldsUpdated = true;
+      } catch (error) {
+        addSyncError(errors, "update_fields", error, "Failed to update target fields");
+        return {
+          issueId,
+          internalId,
+          status: "failure" as const,
+          fieldsUpdated,
+          attachments: attachmentResults,
+          attachmentSummary: {
+            sourceCount: sourceAttachmentsCount,
+            targetCount: targetAttachmentsCount,
+            uploadedCount: 0,
+            skippedCount: 0,
+            failedCount: 0,
+          },
+          errors,
+        };
+      }
+
+      const sourceAttachments = sourceIssue.fields?.attachment || [];
+      const targetAttachments = targetIssue.fields?.attachment || [];
+      sourceAttachmentsCount = sourceAttachments.length;
+      targetAttachmentsCount = targetAttachments.length;
+
+      const targetFingerprintSet = new Set<string>(
+        targetAttachments.map((att: any) => attachmentFingerprint(att)),
+      );
+
+      for (const sourceAttachment of sourceAttachments) {
+        const filename = sourceAttachment.filename || "unknown";
+        const size = sourceAttachment.size || 0;
+        const fingerprint = attachmentFingerprint(sourceAttachment);
+
+        if (targetFingerprintSet.has(fingerprint)) {
+          attachmentResults.push({
+            filename,
+            size,
+            action: "skipped",
+            retryable: false,
+          });
+          continue;
+        }
+
+        try {
+          const payload = await downloadAttachment(
+            sourceAttachment.content,
+            externalConfig.pat,
+            filename,
+          );
+          await uploadAttachment(
+            internalConfig.url,
+            internalConfig.pat,
+            internalId,
+            filename,
+            payload,
+          );
+          attachmentResults.push({
+            filename,
+            size,
+            action: "uploaded",
+            retryable: false,
+          });
+        } catch (error) {
+          const classified = classifySyncError(error);
+          attachmentResults.push({
+            filename,
+            size,
+            action: "failed",
+            retryable: classified.retryable,
+            errorType: classified.type,
+            error: classified.message,
+          });
+          addSyncError(errors, "transfer_attachments", error, `Failed to transfer ${filename}`);
+        }
+      }
+
+      const uploadedCount = attachmentResults.filter((a) => a.action === "uploaded").length;
+      const skippedCount = attachmentResults.filter((a) => a.action === "skipped").length;
+      const failedCount = attachmentResults.filter((a) => a.action === "failed").length;
+      const status = failedCount === 0 ? "success" : "partial";
+
+      return {
+        issueId,
+        internalId,
+        status,
+        fieldsUpdated,
+        attachments: attachmentResults,
+        attachmentSummary: {
+          sourceCount: sourceAttachmentsCount,
+          targetCount: targetAttachmentsCount,
+          uploadedCount,
+          skippedCount,
+          failedCount,
+        },
+        errors,
+      };
+    } catch (error) {
+      addSyncError(errors, "transfer_attachments", error, "Unexpected update failure");
+      return {
+        issueId,
+        internalId,
+        status: "failure" as const,
+        fieldsUpdated,
+        attachments: attachmentResults,
+        attachmentSummary: {
+          sourceCount: sourceAttachmentsCount,
+          targetCount: targetAttachmentsCount,
+          uploadedCount: attachmentResults.filter((a) => a.action === "uploaded").length,
+          skippedCount: attachmentResults.filter((a) => a.action === "skipped").length,
+          failedCount: attachmentResults.filter((a) => a.action === "failed").length,
+        },
+        errors,
+      };
     }
   });
