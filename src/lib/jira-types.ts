@@ -21,6 +21,8 @@ export interface JiraIssue {
 export interface JiraConfig {
   url: string;
   pat: string;
+  instanceType?: "server" | "cloud";
+  email?: string;
 }
 
 export interface JiraProject {

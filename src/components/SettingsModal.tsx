@@ -32,6 +32,8 @@ export function SettingsModal({ trigger, open, onOpenChange }: SettingsModalProp
   // External Jira state
   const [extUrl, setExtUrl] = useState("");
   const [extPat, setExtPat] = useState("");
+  const [extInstanceType, setExtInstanceType] = useState<"server" | "cloud">("server");
+  const [extEmail, setExtEmail] = useState("");
 
   // Internal Jira state
   const [intUrl, setIntUrl] = useState("");
@@ -42,6 +44,8 @@ export function SettingsModal({ trigger, open, onOpenChange }: SettingsModalProp
     if (activeOpen) {
       setExtUrl(config.externalJira.url);
       setExtPat(config.externalJira.pat);
+      setExtInstanceType(config.externalJira.instanceType ?? "server");
+      setExtEmail(config.externalJira.email ?? "");
 
       setIntUrl(config.internalJira.url);
       setIntPat(config.internalJira.pat);
@@ -54,10 +58,17 @@ export function SettingsModal({ trigger, open, onOpenChange }: SettingsModalProp
       return;
     }
 
+    if (extInstanceType === "cloud" && !extEmail.trim()) {
+      toast.error("Email is required for Jira Cloud authentication");
+      return;
+    }
+
     const success = saveConfig({
       externalJira: {
         url: extUrl.trim(),
         pat: extPat.trim(),
+        instanceType: extInstanceType,
+        email: extInstanceType === "cloud" ? extEmail.trim() : undefined,
       },
       internalJira: {
         url: intUrl.trim(),
@@ -114,20 +125,59 @@ export function SettingsModal({ trigger, open, onOpenChange }: SettingsModalProp
               External JIRA Instance (Source)
             </h3>
             <div className="space-y-2">
+              <Label>Instance Type</Label>
+              <div className="flex gap-4 text-sm">
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="ext-instance-type"
+                    value="server"
+                    checked={extInstanceType === "server"}
+                    onChange={() => setExtInstanceType("server")}
+                  />
+                  Server / Data Center
+                </label>
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="ext-instance-type"
+                    value="cloud"
+                    checked={extInstanceType === "cloud"}
+                    onChange={() => setExtInstanceType("cloud")}
+                  />
+                  Cloud
+                </label>
+              </div>
+            </div>
+            <div className="space-y-2">
               <Label htmlFor="ext-url">JIRA Base URL</Label>
               <Input
                 id="ext-url"
-                placeholder="https://company.atlassian.net"
+                placeholder={extInstanceType === "cloud" ? "https://yourcompany.atlassian.net" : "https://jira.company.com"}
                 value={extUrl}
                 onChange={(e) => setExtUrl(e.target.value)}
               />
             </div>
+            {extInstanceType === "cloud" && (
+              <div className="space-y-2">
+                <Label htmlFor="ext-email">Email</Label>
+                <Input
+                  id="ext-email"
+                  type="email"
+                  placeholder="you@company.com"
+                  value={extEmail}
+                  onChange={(e) => setExtEmail(e.target.value)}
+                />
+              </div>
+            )}
             <div className="space-y-2">
-              <Label htmlFor="ext-pat">Personal Access Token (PAT)</Label>
+              <Label htmlFor="ext-pat">
+                {extInstanceType === "cloud" ? "API Token" : "Personal Access Token (PAT)"}
+              </Label>
               <Input
                 id="ext-pat"
                 type="password"
-                placeholder="JIRA PAT Token"
+                placeholder={extInstanceType === "cloud" ? "Atlassian API Token" : "JIRA PAT Token"}
                 value={extPat}
                 onChange={(e) => setExtPat(e.target.value)}
               />

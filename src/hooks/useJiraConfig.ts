@@ -4,7 +4,7 @@ import { type JiraAuthConfig, type JiraConfig } from "@/lib/jira-types";
 const LOCAL_STORAGE_KEY = "jira_sync_auth_config";
 
 const defaultConfig: JiraAuthConfig = {
-  externalJira: { url: "", pat: "" },
+  externalJira: { url: "", pat: "", instanceType: "server", email: "" },
   internalJira: { url: "", pat: "" },
 };
 
@@ -16,7 +16,12 @@ export function useJiraConfig() {
     try {
       const stored = localStorage.getItem(LOCAL_STORAGE_KEY);
       if (stored) {
-        setConfig(JSON.parse(stored));
+        const parsed = JSON.parse(stored);
+        // Backward-compat: default instanceType to "server" if absent
+        if (!parsed.externalJira.instanceType) {
+          parsed.externalJira.instanceType = "server";
+        }
+        setConfig(parsed);
       }
     } catch (e) {
       console.error("Failed to parse JIRA config from localStorage:", e);

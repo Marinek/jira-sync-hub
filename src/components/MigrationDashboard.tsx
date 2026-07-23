@@ -96,6 +96,7 @@ export function MigrationDashboard() {
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [detailsDescription, setDetailsDescription] = useState("");
   const [detailsComments, setDetailsComments] = useState<any[]>([]);
+  const [detailsAttachments, setDetailsAttachments] = useState<any[]>([]);
   const [detailsDialogOpen, setDetailsDialogOpen] = useState(false);
 
   const [syncStateByIssueId, setSyncStateByIssueId] = useState<
@@ -118,6 +119,7 @@ export function MigrationDashboard() {
     setDetailsLoading(true);
     setDetailsDescription("");
     setDetailsComments([]);
+    setDetailsAttachments([]);
     setDetailsDialogOpen(true);
 
     try {
@@ -129,6 +131,7 @@ export function MigrationDashboard() {
       });
       setDetailsDescription(res.description || "No description provided.");
       setDetailsComments(res.comments || []);
+      setDetailsAttachments((res as any).attachments || []);
     } catch (err: any) {
       console.error(err);
       toast.error("Failed to load issue details: " + err.message);
@@ -843,6 +846,30 @@ export function MigrationDashboard() {
                   {detailsDescription}
                 </div>
               </div>
+
+              {/* Attachments Section */}
+              {detailsAttachments.length > 0 && (
+                <div className="space-y-2">
+                  <h3 className="text-sm font-semibold text-foreground uppercase tracking-wider">
+                    Attachments ({detailsAttachments.length})
+                  </h3>
+                  <div className="flex flex-wrap gap-2">
+                    {detailsAttachments.map((att: any) => (
+                      <div
+                        key={att.id}
+                        className="flex items-center gap-1.5 rounded border bg-muted/30 px-2.5 py-1.5 text-xs text-foreground"
+                      >
+                        <span className="truncate max-w-[180px]" title={att.filename}>
+                          {att.filename}
+                        </span>
+                        <span className="text-muted-foreground shrink-0">
+                          ({Math.round(att.size / 1024)} KB)
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Comments Section */}
               <div className="space-y-4">

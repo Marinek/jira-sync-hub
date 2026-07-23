@@ -138,15 +138,81 @@ function buildUpdatedDescription(existingDescription: string | undefined, source
 }
 
 // Helper to make requests to JIRA API
-async function fetchJira(url: string, path: string, pat: string, options: RequestInit = {}) {
-  const cleanUrl = url.replace(/\/$/, "");
+function buildAuthHeader(config: JiraConfig): string {
+  if (config.instanceType === "cloud" && config.email) {
+    return `Basic ${btoa(`${config.email}:${config.pat}`)}`;
+  }
+  return `Bearer ${config.pat}`;
+}
+
+/** Returns the REST API base path for the configured instance type. */
+function apiBase(config: JiraConfig): string {
+  return config.instanceType === "cloud" ? "/rest/api/3" : "/rest/api/2";
+}
+
+/**
+ * Converts an Atlassian Document Format (ADF) node to plain text.
+ * Jira Cloud API v3 returns description/comment bodies as ADF objects.
+ * Falls back to string pass-through for Server/Data Center API v2.
+ */
+function adfToText(adf: unknown): string {
+  if (!adf || typeof adf !== "object") {
+    return typeof adf === "string" ? adf : "";
+  }
+  const node = adf as {
+    type?: string;
+    text?: string;
+    content?: unknown[];
+    attrs?: Record<string, unknown>;
+  };
+  switch (node.type) {
+    case "text":
+      return node.text ?? "";
+    case "hardBreak":
+      return "\n";
+    case "mention":
+      return `@${node.attrs?.text ?? node.attrs?.id ?? ""}`;
+    case "emoji":
+      return node.attrs?.shortName ? String(node.attrs.shortName) : "";
+    case "inlineCard":
+      return node.attrs?.url ? String(node.attrs.url) : "";
+    case "mediaInline":
+    case "media":
+      return "";
+    default:
+      break;
+  }
+  if (!Array.isArray(node.content)) return "";
+  const parts = node.content.map(adfToText);
+  switch (node.type) {
+    case "paragraph":
+    case "heading":
+      return parts.join("") + "\n";
+    case "listItem":
+      return "• " + parts.join("").trimEnd() + "\n";
+    case "bulletList":
+    case "orderedList":
+      return parts.join("") + "\n";
+    case "blockquote":
+      return parts.map((p) => "> " + p).join("") + "\n";
+    case "codeBlock":
+      return "```\n" + parts.join("") + "```\n";
+    case "rule":
+      return "\n---\n";
+    default:
+      return parts.join("");
+  }
+}
+
+async function fetchJira(config: JiraConfig, path: string, options: RequestInit = {}) {
+  const cleanUrl = config.url.replace(/\/$/, "");
   const targetUrl = `${cleanUrl}${path}`;
   const method = options.method || "GET";
 
   console.log(`📡 [JIRA Outgoing] ${method} -> ${targetUrl}`);
 
   const headers = new Headers(options.headers);
-  headers.set("Authorization", `Bearer ${pat}`);
+  headers.set("Authorization", buildAuthHeader(config));
   headers.set("Accept", "application/json");
   headers.set("Content-Type", "application/json");
 
@@ -181,12 +247,12 @@ async function fetchJira(url: string, path: string, pat: string, options: Reques
 
 async function downloadAttachment(
   contentUrl: string,
-  externalPat: string,
+  externalConfig: JiraConfig,
   filename: string,
 ): Promise<Blob> {
   const response = await fetch(contentUrl, {
     headers: {
-      Authorization: `Bearer ${externalPat}`,
+      Authorization: buildAuthHeader(externalConfig),
     },
     signal: AbortSignal.timeout(45000),
   });
@@ -239,6 +305,8 @@ async function uploadAttachment(
 const jiraConfigSchema = z.object({
   url: z.string(),
   pat: z.string(),
+  instanceType: z.enum(["server", "cloud"]).optional(),
+  email: z.string().optional(),
 });
 
 export const searchJiraIssuesFn = createServerFn({ method: "POST" })
@@ -252,11 +320,21 @@ export const searchJiraIssuesFn = createServerFn({ method: "POST" })
     const { config, jql } = data;
 
     // Default search parameters: get standard fields
-    const fields = "summary,description,updated,assignee,issuetype,status";
-    const path = `/rest/api/2/search?jql=${encodeURIComponent(jql)}&fields=${fields}&maxResults=100`;
+    const fieldList = ["summary", "description", "updated", "assignee", "issuetype", "status"];
 
+    let result: any;
     try {
-      const result = await fetchJira(config.url, path, config.pat);
+      if (config.instanceType === "cloud") {
+        // Jira Cloud dropped GET /rest/api/2/search — use POST /rest/api/3/search/jql
+        result = await fetchJira(config, "/rest/api/3/search/jql", {
+          method: "POST",
+          body: JSON.stringify({ jql, fields: fieldList, maxResults: 100 }),
+        });
+      } else {
+        const fields = fieldList.join(",");
+        const path = `/rest/api/2/search?jql=${encodeURIComponent(jql)}&fields=${fields}&maxResults=100`;
+        result = await fetchJira(config, path);
+      }
 
       const issues: JiraIssue[] = (result.issues || []).map((issue: any) => {
         const fields = issue.fields || {};
@@ -274,7 +352,7 @@ export const searchJiraIssuesFn = createServerFn({ method: "POST" })
         return {
           id: issue.key,
           title: fields.summary || "",
-          description: fields.description || "",
+          description: adfToText(fields.description),
           assignee: {
             name: assigneeName,
             initials,
@@ -301,7 +379,7 @@ export const getJiraProjectsFn = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const { config } = data;
     try {
-      const result = await fetchJira(config.url, "/rest/api/2/project", config.pat);
+      const result = await fetchJira(config, `${apiBase(config)}/project`);
       const projects = (result || []).map((p: any) => ({
         id: p.id,
         key: p.key,
@@ -324,7 +402,7 @@ export const getJiraProjectDetailsFn = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const { config, projectKey } = data;
     try {
-      const result = await fetchJira(config.url, `/rest/api/2/project/${projectKey}`, config.pat);
+      const result = await fetchJira(config, `${apiBase(config)}/project/${projectKey}`);
       const issueTypes = (result.issueTypes || []).map((t: any) => ({
         id: t.id,
         name: t.name,
@@ -353,8 +431,9 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
 
     try {
       // 1. Fetch issue details from external JIRA
-      const issueDetailsPath = `/rest/api/2/issue/${issueId}`;
-      const extIssue = await fetchJira(externalConfig.url, issueDetailsPath, externalConfig.pat);
+      const issueDetailsPath = `${apiBase(externalConfig)}/issue/${issueId}`;
+      const extIssue = await fetchJira(externalConfig, issueDetailsPath);
+      const extDescription = adfToText(extIssue.fields.description);
 
       // 2. Prepare internal issue fields
       const createBody = {
@@ -363,7 +442,7 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
             key: targetProjectKey,
           },
           summary: extIssue.fields.summary,
-          description: `Migrated from ${issueId} (${externalConfig.url}/browse/${issueId})\n\n${extIssue.fields.description || ""}`,
+          description: `Migrated from ${issueId} (${externalConfig.url}/browse/${issueId})\n\n${extDescription}`,
           issuetype: {
             name: targetIssueTypeName || extIssue.fields.issuetype?.name || "Task",
           },
@@ -372,15 +451,10 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
       };
 
       // 3. Post to internal JIRA
-      const createResult = await fetchJira(
-        internalConfig.url,
-        "/rest/api/2/issue",
-        internalConfig.pat,
-        {
-          method: "POST",
-          body: JSON.stringify(createBody),
-        },
-      );
+      const createResult = await fetchJira(internalConfig, "/rest/api/2/issue", {
+        method: "POST",
+        body: JSON.stringify(createBody),
+      });
 
       // 4. Copy attachments if present
       const attachments = extIssue.fields.attachment || [];
@@ -393,7 +467,7 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
             // Download from external
             const downloadRes = await fetch(att.content, {
               headers: {
-                Authorization: `Bearer ${externalConfig.pat}`,
+                Authorization: buildAuthHeader(externalConfig),
               },
             });
             if (!downloadRes.ok) {
@@ -410,7 +484,7 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
             const uploadRes = await fetch(uploadUrl, {
               method: "POST",
               headers: {
-                Authorization: `Bearer ${internalConfig.pat}`,
+                Authorization: buildAuthHeader(internalConfig),
                 "X-Atlassian-Token": "no-check", // Mandatory for JIRA attachment endpoint
               },
               body: uploadForm,
@@ -531,13 +605,9 @@ export const getJiraIssueDetailsFn = createServerFn({ method: "POST" })
         const { getMockIssueDetails } = await import("./jira-mock");
         return getMockIssueDetails(issueId);
       }
-      const result = await fetchJira(
-        config.url,
-        `/rest/api/2/issue/${issueId}?fields=description,comment`,
-        config.pat,
-      );
+      const result = await fetchJira(config, `${apiBase(config)}/issue/${issueId}?fields=description,comment,attachment`);
       const fields = result.fields || {};
-      const description = fields.description || "";
+      const description = adfToText(fields.description);
       const commentsList = fields.comment?.comments || [];
 
       const comments = commentsList.map((c: any) => {
@@ -556,12 +626,20 @@ export const getJiraIssueDetailsFn = createServerFn({ method: "POST" })
             name: authorName,
             initials,
           },
-          body: c.body || "",
+          body: adfToText(c.body),
           createdAt: c.created || new Date().toISOString(),
         };
       });
 
-      return { description, comments };
+      const attachments = (fields.attachment || []).map((att: any) => ({
+        id: att.id,
+        filename: att.filename || "unknown",
+        size: att.size || 0,
+        mimeType: att.mimeType || "",
+        content: att.content || "",
+      }));
+
+      return { description, comments, attachments };
     } catch (error: any) {
       console.error("Error in getJiraIssueDetailsFn:", error);
       throw error;
@@ -587,12 +665,12 @@ export const updateMappedJiraIssueFn = createServerFn({ method: "POST" })
     let fieldsUpdated = false;
 
     try {
-      const sourceIssuePath = `/rest/api/2/issue/${issueId}?fields=summary,description,attachment`;
+      const sourceIssuePath = `${apiBase(externalConfig)}/issue/${issueId}?fields=summary,description,attachment`;
       const targetIssuePath = `/rest/api/2/issue/${internalId}?fields=description,attachment`;
 
       let sourceIssue: any;
       try {
-        sourceIssue = await fetchJira(externalConfig.url, sourceIssuePath, externalConfig.pat);
+        sourceIssue = await fetchJira(externalConfig, sourceIssuePath);
       } catch (error) {
         addSyncError(errors, "fetch_source", error, "Failed to fetch source issue");
         return {
@@ -614,7 +692,7 @@ export const updateMappedJiraIssueFn = createServerFn({ method: "POST" })
 
       let targetIssue: any;
       try {
-        targetIssue = await fetchJira(internalConfig.url, targetIssuePath, internalConfig.pat);
+        targetIssue = await fetchJira(internalConfig, targetIssuePath);
       } catch (error) {
         addSyncError(errors, "fetch_target", error, "Failed to fetch target issue");
         return {
@@ -635,14 +713,14 @@ export const updateMappedJiraIssueFn = createServerFn({ method: "POST" })
       }
 
       try {
-        await fetchJira(internalConfig.url, `/rest/api/2/issue/${internalId}`, internalConfig.pat, {
+        await fetchJira(internalConfig, `/rest/api/2/issue/${internalId}`, {
           method: "PUT",
           body: JSON.stringify({
             fields: {
               summary: sourceIssue.fields?.summary || "",
               description: buildUpdatedDescription(
                 targetIssue.fields?.description,
-                sourceIssue.fields?.description || "",
+                adfToText(sourceIssue.fields?.description),
               ),
             },
           }),
@@ -694,7 +772,7 @@ export const updateMappedJiraIssueFn = createServerFn({ method: "POST" })
         try {
           const payload = await downloadAttachment(
             sourceAttachment.content,
-            externalConfig.pat,
+            externalConfig,
             filename,
           );
           await uploadAttachment(
