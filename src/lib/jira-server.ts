@@ -302,6 +302,82 @@ async function uploadAttachment(
   }
 }
 
+async function postComment(
+  config: JiraConfig,
+  issueKey: string,
+  commentBody: string,
+): Promise<void> {
+  if (!issueKey || issueKey === "undefined") {
+    throw new Error(`Invalid issueKey for posting comment: "${issueKey}"`);
+  }
+  
+  console.log(`📝 Posting comment to issue: ${issueKey}`);
+  const endpoint = `${apiBase(config)}/issue/${issueKey}/comment`;
+  const fullUrl = `${config.url.replace(/\/$/, "")}${endpoint}`;
+  console.log(`📝 Full endpoint URL: ${fullUrl}`);
+  
+  const response = await fetch(fullUrl, {
+    method: "POST",
+    headers: {
+      Authorization: buildAuthHeader(config),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ body: commentBody }),
+    signal: AbortSignal.timeout(30000),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new JiraHttpError(
+      `Failed to post comment to ${fullUrl}: ${response.statusText} (${response.status}) - ${body}`,
+      response.status,
+      response.statusText,
+      body,
+    );
+  }
+}
+
+async function fetchCommentsForIssue(
+  config: JiraConfig,
+  issueId: string,
+): Promise<Array<{ id: string; author: { displayName?: string; name?: string }; body: unknown; created: string }>> {
+  try {
+    const result = await fetchJira(config, `${apiBase(config)}/issue/${issueId}?fields=comment`);
+    return result.fields?.comment?.comments || [];
+  } catch (error) {
+    console.error("Error fetching comments:", error);
+    return [];
+  }
+}
+
+async function getAcceptanceCriteriaValue(
+  config: JiraConfig,
+  issueId: string,
+): Promise<string | null> {
+  try {
+    const result = await fetchJira(config, `${apiBase(config)}/issue/${issueId}?fields=*all`);
+    const fields = result.fields || {};
+
+    // Look for field containing "Acceptance Criteria"
+    for (const [fieldKey, fieldValue] of Object.entries(fields)) {
+      if (fieldKey.includes("Acceptance") && fieldKey.includes("Criteria")) {
+        if (typeof fieldValue === "string") {
+          return fieldValue;
+        }
+        // If it's an ADF object, convert it
+        if (fieldValue && typeof fieldValue === "object") {
+          return adfToText(fieldValue);
+        }
+      }
+    }
+
+    return null;
+  } catch (error) {
+    console.error("Error fetching acceptance criteria:", error);
+    return null;
+  }
+}
+
 const jiraConfigSchema = z.object({
   url: z.string(),
   pat: z.string(),
@@ -424,16 +500,37 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
       issueId: z.string(),
       targetProjectKey: z.string(),
       targetIssueTypeName: z.string().optional(),
+      copyComments: z.boolean().optional().default(false),
     }),
   )
   .handler(async ({ data }) => {
-    const { externalConfig, internalConfig, issueId, targetProjectKey, targetIssueTypeName } = data;
+    const { externalConfig, internalConfig, issueId, targetProjectKey, targetIssueTypeName, copyComments } = data;
 
     try {
       // 1. Fetch issue details from external JIRA
-      const issueDetailsPath = `${apiBase(externalConfig)}/issue/${issueId}`;
+      const issueDetailsPath = `${apiBase(externalConfig)}/issue/${issueId}?fields=description,comment,attachment,*all`;
       const extIssue = await fetchJira(externalConfig, issueDetailsPath);
       const extDescription = adfToText(extIssue.fields.description);
+
+      // Fetch Acceptance Criteria
+      let acceptanceCriteria: string | null = null;
+      const fields = extIssue.fields || {};
+      for (const [fieldKey, fieldValue] of Object.entries(fields)) {
+        if (fieldKey.includes("Acceptance") && fieldKey.includes("Criteria")) {
+          if (typeof fieldValue === "string") {
+            acceptanceCriteria = fieldValue;
+          } else if (fieldValue && typeof fieldValue === "object") {
+            acceptanceCriteria = adfToText(fieldValue);
+          }
+          break;
+        }
+      }
+
+      // Build description with AC concatenation
+      let finalDescription = `Migrated from ${issueId} (${externalConfig.url}/browse/${issueId})\n\n${extDescription}`;
+      if (acceptanceCriteria) {
+        finalDescription += `\n\n## Acceptance Criteria\n\n${acceptanceCriteria}`;
+      }
 
       // 2. Prepare internal issue fields
       const createBody = {
@@ -442,7 +539,7 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
             key: targetProjectKey,
           },
           summary: extIssue.fields.summary,
-          description: `Migrated from ${issueId} (${externalConfig.url}/browse/${issueId})\n\n${extDescription}`,
+          description: finalDescription,
           issuetype: {
             name: targetIssueTypeName || extIssue.fields.issuetype?.name || "Task",
           },
@@ -455,6 +552,16 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
         method: "POST",
         body: JSON.stringify(createBody),
       });
+      
+      console.log(`✓ Issue created. Response keys:`, Object.keys(createResult));
+      console.log(`✓ Issue.key: ${createResult.key}, Issue.id: ${createResult.id}`);
+      
+      if (!createResult.key && !createResult.id) {
+        throw new Error(`Issue creation failed: no key or id in response. Full response: ${JSON.stringify(createResult)}`);
+      }
+      
+      const createdIssueKey = createResult.key || createResult.id;
+      console.log(`✓ Created issue with key/id: ${createdIssueKey}`);
 
       // 4. Copy attachments if present
       const attachments = extIssue.fields.attachment || [];
@@ -479,7 +586,7 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
             const uploadForm = new FormData();
             uploadForm.append("file", blob, att.filename);
 
-            const uploadUrl = `${internalConfig.url.replace(/\/$/, "")}/rest/api/2/issue/${createResult.key}/attachments`;
+            const uploadUrl = `${internalConfig.url.replace(/\/$/, "")}/rest/api/2/issue/${createdIssueKey}/attachments`;
 
             const uploadRes = await fetch(uploadUrl, {
               method: "POST",
@@ -502,8 +609,42 @@ export const migrateJiraIssueFn = createServerFn({ method: "POST" })
         }
       }
 
+      // 5. Copy comments if requested
+      let commentsCopied = 0;
+      let commentsFailed = 0;
+      const commentErrors: string[] = [];
+
+      if (copyComments) {
+        const sourceComments = extIssue.fields?.comment?.comments || [];
+        console.log(`💬 Found ${sourceComments.length} comments to copy for issue ${issueId}`);
+
+        for (const comment of sourceComments) {
+          try {
+            const authorName = comment.author?.displayName || comment.author?.name || "Unknown Author";
+            const commentBody = adfToText(comment.body);
+            const fullCommentBody = `**Posted by: ${authorName}**\n\n${commentBody}`;
+
+            await postComment(internalConfig, createdIssueKey, fullCommentBody);
+            commentsCopied++;
+            console.log(`✓ Copied comment from ${authorName}`);
+          } catch (commentErr: any) {
+            commentsFailed++;
+            const errorMsg = commentErr?.message || String(commentErr);
+            commentErrors.push(errorMsg);
+            console.error(`Error copying comment:`, commentErr);
+          }
+        }
+      }
+
       return {
-        internalId: createResult.key, // returns something like "INT-1234"
+        internalId: createdIssueKey, // returns something like "INT-1234"
+        commentCopyResult: copyComments
+          ? {
+              copiedCount: commentsCopied,
+              failedCount: commentsFailed,
+              errors: commentErrors,
+            }
+          : undefined,
       };
     } catch (error: any) {
       console.error("Error in migrateJiraIssueFn:", error);
@@ -605,10 +746,23 @@ export const getJiraIssueDetailsFn = createServerFn({ method: "POST" })
         const { getMockIssueDetails } = await import("./jira-mock");
         return getMockIssueDetails(issueId);
       }
-      const result = await fetchJira(config, `${apiBase(config)}/issue/${issueId}?fields=description,comment,attachment`);
+      const result = await fetchJira(config, `${apiBase(config)}/issue/${issueId}?fields=description,comment,attachment,*all`);
       const fields = result.fields || {};
       const description = adfToText(fields.description);
       const commentsList = fields.comment?.comments || [];
+
+      // Fetch Acceptance Criteria
+      let acceptanceCriteria: string | null = null;
+      for (const [fieldKey, fieldValue] of Object.entries(fields)) {
+        if (fieldKey.includes("Acceptance") && fieldKey.includes("Criteria")) {
+          if (typeof fieldValue === "string") {
+            acceptanceCriteria = fieldValue;
+          } else if (fieldValue && typeof fieldValue === "object") {
+            acceptanceCriteria = adfToText(fieldValue);
+          }
+          break;
+        }
+      }
 
       const comments = commentsList.map((c: any) => {
         const authorName = c.author?.displayName || c.author?.name || "Unknown Author";
@@ -639,7 +793,7 @@ export const getJiraIssueDetailsFn = createServerFn({ method: "POST" })
         content: att.content || "",
       }));
 
-      return { description, comments, attachments };
+      return { description, comments, attachments, acceptanceCriteria };
     } catch (error: any) {
       console.error("Error in getJiraIssueDetailsFn:", error);
       throw error;
@@ -653,10 +807,11 @@ export const updateMappedJiraIssueFn = createServerFn({ method: "POST" })
       internalConfig: jiraConfigSchema,
       issueId: z.string(),
       internalId: z.string(),
+      copyComments: z.boolean().optional().default(false),
     }),
   )
   .handler(async ({ data }) => {
-    const { externalConfig, internalConfig, issueId, internalId } = data;
+    const { externalConfig, internalConfig, issueId, internalId, copyComments } = data;
     const errors: SyncStepError[] = [];
     const attachmentResults: SyncAttachmentResult[] = [];
 
@@ -665,8 +820,8 @@ export const updateMappedJiraIssueFn = createServerFn({ method: "POST" })
     let fieldsUpdated = false;
 
     try {
-      const sourceIssuePath = `${apiBase(externalConfig)}/issue/${issueId}?fields=summary,description,attachment`;
-      const targetIssuePath = `/rest/api/2/issue/${internalId}?fields=description,attachment`;
+      const sourceIssuePath = `${apiBase(externalConfig)}/issue/${issueId}?fields=summary,description,attachment,comment`;
+      const targetIssuePath = `${apiBase(internalConfig)}/issue/${internalId}?fields=description,attachment,comment`;
 
       let sourceIssue: any;
       try {
@@ -802,10 +957,50 @@ export const updateMappedJiraIssueFn = createServerFn({ method: "POST" })
         }
       }
 
+      // 5. Copy comments if requested
+      let commentsCopied = 0;
+      let commentsFailed = 0;
+      const commentErrors: string[] = [];
+
+      if (copyComments) {
+        const sourceComments = sourceIssue.fields?.comment?.comments || [];
+        const targetComments = targetIssue.fields?.comment?.comments || [];
+
+        // Create a set of existing target comment bodies to avoid duplicates (simple check)
+        const existingCommentBodies = new Set<string>(
+          targetComments.map((c: any) => adfToText(c.body).trim())
+        );
+
+        console.log(`💬 Found ${sourceComments.length} source comments, ${targetComments.length} existing target comments`);
+
+        for (const comment of sourceComments) {
+          try {
+            const authorName = comment.author?.displayName || comment.author?.name || "Unknown Author";
+            const commentBody = adfToText(comment.body);
+            const fullCommentBody = `**Posted by: ${authorName}**\n\n${commentBody}`;
+
+            // Skip if comment already exists on target (simple duplicate check)
+            if (existingCommentBodies.has(commentBody.trim())) {
+              console.log(`⊘ Comment already exists on target, skipping`);
+              continue;
+            }
+
+            await postComment(internalConfig, internalId, fullCommentBody);
+            commentsCopied++;
+            console.log(`✓ Copied comment from ${authorName}`);
+          } catch (commentErr: any) {
+            commentsFailed++;
+            const errorMsg = commentErr?.message || String(commentErr);
+            commentErrors.push(errorMsg);
+            console.error(`Error copying comment:`, commentErr);
+          }
+        }
+      }
+
       const uploadedCount = attachmentResults.filter((a) => a.action === "uploaded").length;
       const skippedCount = attachmentResults.filter((a) => a.action === "skipped").length;
       const failedCount = attachmentResults.filter((a) => a.action === "failed").length;
-      const status = failedCount === 0 ? "success" : "partial";
+      const status = failedCount === 0 && commentsFailed === 0 ? "success" : "partial";
 
       return {
         issueId,
@@ -820,6 +1015,13 @@ export const updateMappedJiraIssueFn = createServerFn({ method: "POST" })
           skippedCount,
           failedCount,
         },
+        commentCopyResult: copyComments
+          ? {
+              copiedCount: commentsCopied,
+              failedCount: commentsFailed,
+              errors: commentErrors,
+            }
+          : undefined,
         errors,
       };
     } catch (error) {
@@ -837,6 +1039,13 @@ export const updateMappedJiraIssueFn = createServerFn({ method: "POST" })
           skippedCount: attachmentResults.filter((a) => a.action === "skipped").length,
           failedCount: attachmentResults.filter((a) => a.action === "failed").length,
         },
+        commentCopyResult: copyComments
+          ? {
+              copiedCount: 0,
+              failedCount: 0,
+              errors: [],
+            }
+          : undefined,
         errors,
       };
     }

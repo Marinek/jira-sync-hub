@@ -22,6 +22,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Select,
   SelectContent,
@@ -97,7 +98,20 @@ export function MigrationDashboard() {
   const [detailsDescription, setDetailsDescription] = useState("");
   const [detailsComments, setDetailsComments] = useState<any[]>([]);
   const [detailsAttachments, setDetailsAttachments] = useState<any[]>([]);
+  const [detailsAcceptanceCriteria, setDetailsAcceptanceCriteria] = useState<string | null>(null);
   const [detailsDialogOpen, setDetailsDialogOpen] = useState(false);
+
+  // Copy comments state (session-only, not persisted)
+  const [copyCommentsOnMigration, setCopyCommentsOnMigration] = useState(true);
+  const [copyCommentsOnUpdate, setCopyCommentsOnUpdate] = useState(false);
+
+  // Migration confirmation dialog state
+  const [migrationConfirmDialogOpen, setMigrationConfirmDialogOpen] = useState(false);
+  const [pendingMigrationIssueId, setPendingMigrationIssueId] = useState<string | null>(null);
+
+  // Update confirmation dialog state
+  const [updateConfirmDialogOpen, setUpdateConfirmDialogOpen] = useState(false);
+  const [pendingUpdateIssueId, setPendingUpdateIssueId] = useState<string | null>(null);
 
   const [syncStateByIssueId, setSyncStateByIssueId] = useState<
     Record<
@@ -120,6 +134,7 @@ export function MigrationDashboard() {
     setDetailsDescription("");
     setDetailsComments([]);
     setDetailsAttachments([]);
+    setDetailsAcceptanceCriteria(null);
     setDetailsDialogOpen(true);
 
     try {
@@ -132,6 +147,7 @@ export function MigrationDashboard() {
       setDetailsDescription(res.description || "No description provided.");
       setDetailsComments(res.comments || []);
       setDetailsAttachments((res as any).attachments || []);
+      setDetailsAcceptanceCriteria((res as any).acceptanceCriteria || null);
     } catch (err: any) {
       console.error(err);
       toast.error("Failed to load issue details: " + err.message);
@@ -322,15 +338,18 @@ export function MigrationDashboard() {
     );
 
     try {
-      const { internalId } = await migrateJiraIssueFn({
+      const result = await migrateJiraIssueFn({
         data: {
           externalConfig: config.externalJira,
           internalConfig: config.internalJira,
           issueId,
           targetProjectKey: selectedIntProjectKey,
           targetIssueTypeName: mappedType,
+          copyComments: copyCommentsOnMigration,
         },
       });
+
+      const { internalId, commentCopyResult } = result;
 
       // Update server mappings
       await updateMigrationMappingFn({
@@ -348,7 +367,15 @@ export function MigrationDashboard() {
         ),
       );
 
-      toast.success(`Successfully migrated ${issueId} → ${internalId}`);
+      let successMsg = `Successfully migrated ${issueId} → ${internalId}`;
+      if (commentCopyResult) {
+        successMsg += ` (${commentCopyResult.copiedCount} comments copied`;
+        if (commentCopyResult.failedCount > 0) {
+          successMsg += `, ${commentCopyResult.failedCount} failed`;
+        }
+        successMsg += ")";
+      }
+      toast.success(successMsg);
     } catch (err: any) {
       console.error(err);
       setIssues((prev) =>
@@ -477,6 +504,18 @@ export function MigrationDashboard() {
       return;
     }
 
+    // Show update confirmation dialog
+    setPendingUpdateIssueId(issueId);
+    setUpdateConfirmDialogOpen(true);
+  };
+
+  const performSyncMappedIssue = async (issueId: string) => {
+    const issue = issues.find((i) => i.id === issueId);
+    if (!issue?.internalId) {
+      toast.error(`No mapped target issue exists for ${issueId}.`);
+      return;
+    }
+
     setSyncStateByIssueId((prev) => ({
       ...prev,
       [issueId]: {
@@ -492,6 +531,7 @@ export function MigrationDashboard() {
           internalConfig: config.internalJira,
           issueId,
           internalId: issue.internalId,
+          copyComments: copyCommentsOnUpdate,
         },
       });
 
@@ -501,12 +541,21 @@ export function MigrationDashboard() {
       const hasRetryableErrors =
         failedList.some((a: any) => a.retryable) || result.errors.some((e: any) => e.retryable);
 
-      const message =
+      let message =
         result.status === "success"
           ? `Updated ${issueId} (${summary.uploadedCount} uploaded, ${summary.skippedCount} already present)`
           : result.status === "partial"
             ? `Partially updated ${issueId} (${summary.uploadedCount} uploaded, ${summary.failedCount} failed)`
             : `Failed to update ${issueId}`;
+
+      // Add comment copy result to message if present
+      if (result.commentCopyResult) {
+        message += ` (${result.commentCopyResult.copiedCount} comments copied`;
+        if (result.commentCopyResult.failedCount > 0) {
+          message += `, ${result.commentCopyResult.failedCount} failed`;
+        }
+        message += ")";
+      }
 
       setSyncStateByIssueId((prev) => ({
         ...prev,
@@ -808,6 +857,16 @@ export function MigrationDashboard() {
                 </SelectContent>
               </Select>
             </div>
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="copy-comments-migrate"
+                checked={copyCommentsOnMigration}
+                onCheckedChange={(checked) => setCopyCommentsOnMigration(checked as boolean)}
+              />
+              <label htmlFor="copy-comments-migrate" className="text-sm font-medium cursor-pointer">
+                Copy comments from source issue
+              </label>
+            </div>
           </div>
 
           <DialogFooter>
@@ -846,6 +905,18 @@ export function MigrationDashboard() {
                   {detailsDescription}
                 </div>
               </div>
+
+              {/* Acceptance Criteria Section */}
+              {detailsAcceptanceCriteria && (
+                <div className="space-y-2">
+                  <h3 className="text-sm font-semibold text-foreground uppercase tracking-wider">
+                    Acceptance Criteria
+                  </h3>
+                  <div className="rounded-lg border border-amber-200 bg-amber-50/50 dark:border-amber-800 dark:bg-amber-950/20 p-4 text-sm text-foreground whitespace-pre-wrap leading-relaxed">
+                    {detailsAcceptanceCriteria}
+                  </div>
+                </div>
+              )}
 
               {/* Attachments Section */}
               {detailsAttachments.length > 0 && (
@@ -908,6 +979,46 @@ export function MigrationDashboard() {
 
           <DialogFooter>
             <Button onClick={() => setDetailsDialogOpen(false)}>Close</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={updateConfirmDialogOpen} onOpenChange={setUpdateConfirmDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Update Mapped Issue</DialogTitle>
+            <DialogDescription>
+              Choose whether to copy new comments from the source issue
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 py-4">
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="copy-comments-update"
+                checked={copyCommentsOnUpdate}
+                onCheckedChange={(checked) => setCopyCommentsOnUpdate(checked as boolean)}
+              />
+              <label htmlFor="copy-comments-update" className="text-sm font-medium cursor-pointer">
+                Copy new comments from source issue
+              </label>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setUpdateConfirmDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={async () => {
+                setUpdateConfirmDialogOpen(false);
+                if (pendingUpdateIssueId) {
+                  await performSyncMappedIssue(pendingUpdateIssueId);
+                }
+              }}
+            >
+              Proceed with Update
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
